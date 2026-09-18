@@ -33,6 +33,9 @@ ID3D11DeviceContext *d3d8_GetD3D11Context(void);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 HWND                 d3d8_GetHWND(void);
+UINT                 d3d8_ResScale(void);
+UINT                 d3d8_GetGuestWidth(void);
+UINT                 d3d8_GetGuestHeight(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 

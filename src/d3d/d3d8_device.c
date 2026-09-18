@@ -147,6 +147,27 @@ void d3d8_PresentFrame(void)
  * Internal accessors (used by d3d8_resources/shaders/states)
  * ================================================================ */
 
+/* EXPERIMENT (design/resolution-fps-cap): internal render scale.
+ * RECOMP_RES_SCALE=<n> renders every render target n times larger while the
+ * guest keeps its own 640x480 coordinates. Throwaway; see
+ * docs/technical/resolution-and-framerate.md. */
+static UINT g_res_scale;
+static UINT g_guest_w = 640, g_guest_h = 480;
+
+UINT d3d8_ResScale(void)
+{
+    if (!g_res_scale) {
+        const char *e = getenv("RECOMP_RES_SCALE");
+        int v = e ? atoi(e) : 1;
+        g_res_scale = (v >= 1 && v <= 8) ? (UINT)v : 1;
+        if (g_res_scale != 1)
+            fprintf(stderr, "D3D8: internal render scale %ux (RECOMP_RES_SCALE)\n", g_res_scale);
+    }
+    return g_res_scale;
+}
+UINT d3d8_GetGuestWidth(void)  { return g_guest_w; }
+UINT d3d8_GetGuestHeight(void) { return g_guest_h; }
+
 IDirect3DDevice8    *d3d8_GetDevice(void) { return &g_device; }
 ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
@@ -201,8 +222,10 @@ static HRESULT d3d11_create_device_and_swap_chain(
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
-    scd.BufferDesc.Width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
-    scd.BufferDesc.Height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+    g_guest_w = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
+    g_guest_h = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+    scd.BufferDesc.Width = g_guest_w * d3d8_ResScale();
+    scd.BufferDesc.Height = g_guest_h * d3d8_ResScale();
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
@@ -1039,6 +1062,10 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
 static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *self, UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture8 **ppTexture)
 {
     (void)self; (void)Pool;
+    if (Usage & D3DUSAGE_RENDERTARGET) {
+        Width *= d3d8_ResScale(); Height *= d3d8_ResScale();
+        Levels = 1;
+    }
     return d3d8_CreateTextureImpl(Width, Height, Levels, Usage, Format, ppTexture);
 }
 
@@ -1076,6 +1103,7 @@ static HRESULT __stdcall dev_CreateRenderTarget(IDirect3DDevice8 *self, UINT Wid
 {
     (void)self; (void)Lockable;
     D3D11_TEXTURE2D_DESC td;
+    Width *= d3d8_ResScale(); Height *= d3d8_ResScale();
     ID3D11Texture2D *tex = NULL;
     HRESULT hr;
     UINT sample_count;
@@ -1138,6 +1166,7 @@ static HRESULT __stdcall dev_CreateRenderTarget(IDirect3DDevice8 *self, UINT Wid
 static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface8 **ppSurface)
 {
     (void)self;
+    Width *= d3d8_ResScale(); Height *= d3d8_ResScale();
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D *tex = NULL;
     DXGI_FORMAT dxgi;
@@ -1307,10 +1336,11 @@ static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPO
         g_device_state.viewport = *pViewport;
 
         D3D11_VIEWPORT d3d11_vp;
-        d3d11_vp.TopLeftX = (FLOAT)pViewport->X;
-        d3d11_vp.TopLeftY = (FLOAT)pViewport->Y;
-        d3d11_vp.Width    = (FLOAT)pViewport->Width;
-        d3d11_vp.Height   = (FLOAT)pViewport->Height;
+        FLOAT k = (FLOAT)d3d8_ResScale();
+        d3d11_vp.TopLeftX = (FLOAT)pViewport->X * k;
+        d3d11_vp.TopLeftY = (FLOAT)pViewport->Y * k;
+        d3d11_vp.Width    = (FLOAT)pViewport->Width * k;
+        d3d11_vp.Height   = (FLOAT)pViewport->Height * k;
         d3d11_vp.MinDepth = pViewport->MinZ;
         d3d11_vp.MaxDepth = pViewport->MaxZ;
         ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &d3d11_vp);

@@ -984,7 +984,7 @@ int main(int argc, char **argv)
     r.width  = h->width  ? h->width  : 640;
     r.height = h->height ? h->height : 480;
 
-    hwnd = replay_window(r.width, r.height);
+    hwnd = replay_window(r.width * d3d8_ResScale(), r.height * d3d8_ResScale());
     if (!hwnd) {
         fprintf(stderr, "[replay] CreateWindow failed (%lu)\n", GetLastError());
         d3d8cap_close_read(cap);
@@ -1028,7 +1028,7 @@ int main(int argc, char **argv)
 
         if (dump_every || loop == loops - 1) {
             snprintf(out, sizeof out, "%s%03d.bmp", prefix, loop);
-            dump_bmp(r.dev, out, r.width, r.height);
+            dump_bmp(r.dev, out, r.width * d3d8_ResScale(), r.height * d3d8_ResScale());
         }
         r.dev->lpVtbl->Swap(r.dev, 0);
         pump();
