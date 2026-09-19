@@ -1160,6 +1160,16 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  * 0 presents without waiting, for a device that is not the title's display.
  */
 void xbox_D3D8SetPresentInterval(UINT interval);
+/* The size the guest presents at, for its screen-space geometry; the HLE
+ * sets it from the title's present parameters (d3d8_GetGuestWidth). */
+void xbox_D3D8SetGuestSize(UINT width, UINT height);
+
+/* The Xbox's D3DDevice_SetScissors: clip drawing to the rectangles (or, with
+ * exclusive set, outside them); count 0 turns it off. The host applies one
+ * inclusive rectangle at most. Get returns whether a scissor is set, with
+ * the first rectangle, for capture snapshots. */
+void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
+BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
 
 /**
  * Present frame and pump window messages.
