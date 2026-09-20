@@ -151,6 +151,12 @@ survive the move. Do **not** rewrite them to GLSL. Vulkan's costs here are the Y
 front-face winding inversion (a negative viewport height; note `d3d8_states.c` already
 carries one hand-annotated winding fix, so do not stack a second).
 
+**The plan behind that paragraph is `docs/technical/vulkan-backend.md`** (Sep 2026): only
+7% of `src/d3d` touches D3D11 at all (814 lines of 11.3k, 58 distinct entry points), so the
+seam goes *inside* `src/d3d` as an RHI, not at the COM vtable — `d3d8_gl.c` is the in-tree
+proof of what the vtable seam costs, and it should be deleted once Vulkan can replay a
+frame. Read §4.4 before touching the winding, and §4.10 before choosing a present mode.
+
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
 one frame can be drawn by two backends and compared. That is the bring-up loop for a Vulkan
