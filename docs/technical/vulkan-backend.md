@@ -723,8 +723,8 @@ so if Android is the destination they belong *before* phases 2-5, not after —
 see §6.5's scheduling note. Plus DXT (decompress or transcode), 18 MB of DXC,
 and touch input through `input_bindings.c`. *Pass: a title runs on an ARM64
 device — not compiles, runs, with its physics and RNG matching the x86 build.*
----
 
+---
 
 ## 8. Appendix — reproducing the numbers
 
