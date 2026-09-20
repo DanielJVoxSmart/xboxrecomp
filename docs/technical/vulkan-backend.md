@@ -134,23 +134,30 @@ A Vulkan pipeline key is the union of hashes this code already computes. The
 deferred-resolve model that makes Vulkan awkward to bolt onto an immediate-mode
 front end is the model `src/d3d` is already written in.
 
-### What about DXVK?
+### What about DXVK? — less than it first appears
 
-Worth naming and dismissing carefully, because it is nearly free. DXVK
-translates D3D9/10/11 to Vulkan; the existing backend would run on Linux and
-the Steam Deck under it with no renderer work at all. That is a legitimate way
-to de-risk the Linux story *this week* and to get a second opinion on any
-Vulkan bug ("does it also happen through DXVK?").
+An earlier draft of this document floated DXVK as a way to prove the Linux
+story before writing any Vulkan. **That was wrong, and the reason matters.**
 
-It is not a substitute:
+DXVK supplies `d3d11.dll` *to Wine*. There is no native-Linux D3D11 for the
+existing backend to run on, so "run it under DXVK" means running the
+recompiled Windows executable under Wine or Proton — where **Wine provides
+Win32 and `src/platform/win32_compat.c` is never entered at all.** The POSIX
+memory mapping, the POSIX threading, the POSIX file layer: none of it runs.
+It proves the title works on Linux GPU drivers. It proves nothing about the
+port.
 
-- it does not reach Android, which is a third of CLAUDE.md's stated reason;
-- it keeps the D3DCompile/FXC dependency, which on Linux means Wine's
-  `d3dcompiler`, which is not the same compiler;
-- it leaves the project without control over pipeline construction, barriers
-  or present mode — the three things the rest of this document is about.
+What it is still good for, narrowly: a performance and driver reference point,
+and a second opinion on a Vulkan rendering bug ("does it also happen through
+DXVK?"). It does not reach Android, and it keeps the D3DCompile/FXC dependency
+in the form of Wine's `d3dcompiler`, which is not the same compiler.
 
-Use it as a cross-check, not as the plan.
+**The genuinely cheap Linux probe is phase 1 below**: build the runtime
+natively, supply the two missing POSIX host backends, and boot a title with
+`RECOMP_HLE_D3D8=off`. That exercises exactly the shims DXVK bypasses, needs
+no renderer, and is the project's own documented bring-up order — *"get to a
+black screen with no crashes before caring about rendering"* — applied to a
+new host.
 
 ---
 
@@ -645,58 +652,79 @@ because nothing above `src/d3d` knows which API is underneath.
 So if **Android** is the actual destination, Vulkan-before-#1-#3 is arguably
 the wrong order: the renderer will still retrofit cheaply in a year, and the
 register model and x87 policy will not. If **Linux and the Steam Deck** are the
-destination, Vulkan-first is right, and DXVK (§2) can prove the rest of the
-Linux port works before any Vulkan code is written at all — which is a
-genuinely useful thing to do in an afternoon.
+destination, Vulkan-first is right — and phase 1 below proves the rest of the
+Linux port before any Vulkan code exists, which is the cheap probe DXVK cannot
+give you (§2).
 
 ---
 
 ## 7. Phases
 
-Each phase has a single pass condition that a capture can answer.
+Eight phases. Each has one pass condition a capture or a boot log can answer,
+so "done" is never a judgement call. The Linux work that is *not* the renderer
+runs as phase 1, in parallel with phase 0 and needing none of it — that is the
+cheap probe §2 says DXVK cannot give you.
 
-**Phase 0 — the seam, no Vulkan.** Extract `rhi.h` from the 814 D3D11-touching
-lines; make the six core files plus overlay and screencopy call it; D3D11 stays
-the only implementation. Settle the Vulkan 1.3 / push-descriptor floor and
-verify lavapipe in CI. *Pass: a captured frame replays through the RHI'd D3D11
-backend with a byte-identical readback.* This is the phase that de-risks
-everything and the one most likely to be skipped.
+**Phase 0 — the seam, no Vulkan.** Extract `rhi.h` (~45 entry points) from the
+814 D3D11-touching lines; rewire the six core files plus overlay and screencopy
+through it; make pipeline state a *key* rather than four independent state
+objects. D3D11 stays the only implementation, and its adapter is written
+*second* so the RHI is derived from what Vulkan needs. Settle the Vulkan 1.3
+floor (dynamic rendering, extended dynamic state, push descriptors) and stand
+lavapipe up in the Linux CI job. *Pass: a captured frame replays through the
+RHI'd D3D11 backend with a byte-identical readback.* This phase produces
+nothing visible, which is why it is the one that gets skipped, and skipping it
+is how the project acquires a fourth parallel renderer.
 
-**Phase 1 — a device on screen.** Vulkan instance, device, SDL2 surface,
-swapchain, command buffers, frames-in-flight, present-mode selection, swapchain
-recreation. `rhi_clear` and `rhi_frame_*` only. Build `src/replay` on Linux.
-*Pass: a replayed capture's clear colour fills the window on Linux, and the
-run log names the present mode it chose.*
+**Phase 1 — Linux boots a title with no renderer.** Runs in parallel with
+phase 0. Write `recomp_audio_output_*` and `recomp_input_host_sample` for POSIX
+(SDL2 — `src/input` already uses it there, so only the `src/hle` entry point is
+missing), link a title on Linux with `RECOMP_HLE_D3D8=off`, and find out
+whether `xbox_memory_layout.c`'s 28 mirror views and its apertures actually
+place. Decide FMV: Media Foundation has no POSIX path. *Pass: a title reaches
+its first `Swap` on Linux — CLAUDE.md's "black screen with no crashes", on a
+new host.*
 
-**Phase 2 — the fixed-function path.** Buffers, the UP rings, uncompressed
-textures with upload barriers, the DXGI→VkFormat table, one pipeline key, the
-Y-flip and the single winding inversion, `rhi_draw`/`rhi_draw_indexed`.
-*Pass: a replayed menu or loading frame matches the D3D11 readback.*
+**Phase 2 — a Vulkan device on screen.** Instance, device, SDL2 surface,
+swapchain, frames in flight, swapchain recreation on `OUT_OF_DATE`, present
+mode from the interval (§4.10). Make `src/replay` build on Linux. Validation
+layers on by default in debug. *Pass: a replayed capture's clear colour fills a
+window on Linux, and the log names the present mode it chose.*
 
-**Phase 3 — the generated shaders.** DXC integration, the three binding shifts,
-the descriptor set layout, VSH microcode and register-combiner programs, the
-SPIR-V and pipeline caches. *Pass: a replayed race or level frame matches.*
-This is the phase that proves CLAUDE.md's "~4k lines of translation survive the
-move".
+**Phase 3 — the fixed-function draw path.** Per-frame rings replacing the UP
+rings, uncompressed textures with upload barriers, the per-device
+`DXGI_FORMAT` → `VkFormat` table, the Y-flip and its single winding inversion
+(§4.4), one pipeline key. *Pass: a replayed menu or loading frame matches the
+D3D11 readback.*
 
-**Phase 4 — render targets and the rest of the frame.** Render-to-texture with
-layout transitions, cube faces, depth surfaces, screencopy, batched rendering
-scopes with `loadOp = CLEAR`. *Pass: TimeSplitters 2's three full-screen passes
-reproduce and the frame brightness matches D3D11.*
+**Phase 4 — the generated shaders.** DXC at six call sites, the three binding
+shifts, one descriptor set layout, the `b1` collision, the microcode and
+combiner programs, the persistent SPIR-V and `VkPipelineCache` files. Compile
+every generator's output offline against DXC first, by extending
+`tests/nv2a_vsh_hlsl`. *Pass: a replayed race or level frame matches.* This is
+the phase that proves the "~4k lines survive" claim.
 
-**Phase 5 — a live title.** `RECOMP_D3D8_BACKEND=vulkan` on Windows beside
-D3D11, the overlay's portable text path, F11 capture, the flip gate. *Pass:
-TimeSplitters 2 plays on Vulkan on Windows at a frame time within measuring
-distance of D3D11's.* Then delete `d3d8_gl.c`.
+**Phase 5 — render targets, barriers, the rest of the frame.** One
+`VkImageLayout` per image and one `transition()` helper; render-to-texture and
+cube faces; `d3d8_screencopy.c`; batched rendering scopes with
+`loadOp = CLEAR`. *Pass: TimeSplitters 2's three full-screen passes reproduce
+and the frame brightness matches D3D11.*
 
-**Phase 6 — off Windows.** Linux and Steam Deck live, which also depends on the
-memory model item in CLAUDE.md ("`CreateFileMapping` + fixed-address
-`MapViewOfFileEx`... Win32-only in practice") — **the renderer is not the last
-thing standing between this project and Linux, and finishing it will not by
-itself produce a Linux build.** Then Android: DXT, DXC packaging, and a touch
-input path.
+**Phase 6 — a live title, then delete `d3d8_gl.c`.**
+`RECOMP_D3D8_BACKEND=vulkan` beside D3D11 on Windows, a portable text path for
+the F9 overlay (it is GDI today), F11 capture, the flip gate. Join with phase 1
+for Linux. *Pass: TimeSplitters 2 plays on Vulkan on Windows within measuring
+distance of D3D11, and plays on Linux.*
 
+**Phase 7 — Android, and the two items that are not the renderer.** The lifted
+output is already portable (§6.5). What is not settled is CLAUDE.md's item #2
+(register model) and item #3 (x87 policy), and both bake into generated code,
+so if Android is the destination they belong *before* phases 2-5, not after —
+see §6.5's scheduling note. Plus DXT (decompress or transcode), 18 MB of DXC,
+and touch input through `input_bindings.c`. *Pass: a title runs on an ARM64
+device — not compiles, runs, with its physics and RNG matching the x86 build.*
 ---
+
 
 ## 8. Appendix — reproducing the numbers
 
