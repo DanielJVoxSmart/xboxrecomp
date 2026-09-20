@@ -578,6 +578,79 @@ Ranked risks:
 
 ---
 
+## 6.5 What else stands between this and Linux / Android
+
+The renderer is the reason this document exists, but it is not the only thing
+in the way, and on Android it is not the biggest thing. Measured against the
+tree, so that the Vulkan work is not mistaken for the whole port:
+
+### Linux: four items, and the renderer is one
+
+| Item | State |
+|---|---|
+| **Renderer** | This document. Real work. |
+| **Memory model** | **Already shimmed, and better than CLAUDE.md's table says.** `src/platform/win32_compat.c` implements `CreateFileMappingA/W`, `MapViewOfFileEx`, `VirtualAlloc`, `VirtualProtect`, `CreateThread`, `QueryPerformanceCounter` and `AddVectoredExceptionHandler` on POSIX. `MapViewOfFileEx` uses `MAP_FIXED_NOREPLACE` and checks the returned address, with a long comment recording that bare `MAP_FIXED` silently unmapped live views and that `xbox_memory_layout.c` *depends* on a failed placement failing. Somebody has already debugged the hard part. What is untested is whether the 28 mirror views and the aperture layout actually place on Linux — nothing has ever linked a title there. |
+| **Host audio output** | No POSIX implementation. `recomp_audio_output_*` (`src/hle/audio_output.h`) exists only as `audio_output_xaudio2.cpp`. |
+| **Host input sampling** | No POSIX implementation of `recomp_input_host_sample` (`src/hle/input_host.h`). Note `src/input` itself *already* uses SDL2 on POSIX — it is only this one `src/hle` entry point missing. |
+| **FMV** | `src/video` links Media Foundation, Windows-only, no POSIX path. |
+
+`src/hle/CMakeLists.txt` already states the audio and input gaps and nominates
+SDL2 for both: *"Until those exist the library compiles on POSIX, but a title
+that links it there will be missing those symbols."* Everything in the
+top-level `CMakeLists.txt` already builds in the Linux CI job. So the Linux
+port is the renderer plus two SDL2 backends plus an FMV decision — the
+renderer is roughly a quarter of it, and the other three-quarters are small
+and already scoped in the build system.
+
+### Android: the renderer is maybe a third of it
+
+The host is ARM64, so **the recompiled x86 code itself has to compile and run
+there**, and that is a bigger question than the graphics API.
+
+The good news is measured: `templates/runtime/recomp_types.h` (1,315 lines, the
+header every lifted title includes) was written for this. Its `xmmintrin.h`
+include and its `_mm_cvttss_si32` fast path are both behind
+`#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)`
+with portable fallbacks; the MMX/SSE helpers are deliberately *"lane-wise C
+rather than host intrinsics ... the header stays portable"*; atomics go through
+`__sync_*` off MSVC. The lifter in `tools/recomp` emits no intrinsics and no
+inline assembly at all.
+
+The bad news is that CLAUDE.md's items **#1 memory model, #2 register model and
+#3 x87 policy** all bite hardest on ARM64, and none of them is the renderer:
+
+- **#2 register model** stops being an optimisation on ARM64. CLAUDE.md's own
+  framing — *"ARM hosts (where x86-32 → ARM64 is no longer same-ISA and lifting
+  genuinely pays)"* — is exactly the case where globals defeating aliasing
+  analysis costs most, because there are 31 GPRs to allocate into rather than
+  16 and no same-ISA free ride to fall back on.
+- **#3 x87** is a correctness fork, not a performance one: `long double` is
+  80-bit on x86 GCC/Clang and **128-bit on AArch64**. CLAUDE.md names this. The
+  runtime already carries a per-thread x87 model, so what is missing is the
+  policy decision, not the code.
+- **#1 memory model**: the POSIX shim above works, but fixed-address placement
+  of 32-bit guest VAs is more fragile under Android's allocator than under
+  Linux's, and base+offset is what CLAUDE.md wants anyway.
+
+Plus the renderer's own Android costs from §4.9 and §4.3: DXT decompression or
+transcoding, and 18 MB of DXC.
+
+### The scheduling consequence
+
+CLAUDE.md puts items #1-#4 first and says why: *"The first four get baked into
+generated code and are expensive to retrofit. Do these before any bulk
+codegen."* The renderer is not in that category — it retrofits cheaply,
+because nothing above `src/d3d` knows which API is underneath.
+
+So if **Android** is the actual destination, Vulkan-before-#1-#3 is arguably
+the wrong order: the renderer will still retrofit cheaply in a year, and the
+register model and x87 policy will not. If **Linux and the Steam Deck** are the
+destination, Vulkan-first is right, and DXVK (§2) can prove the rest of the
+Linux port works before any Vulkan code is written at all — which is a
+genuinely useful thing to do in an afternoon.
+
+---
+
 ## 7. Phases
 
 Each phase has a single pass condition that a capture can answer.
