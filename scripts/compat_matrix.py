@@ -206,17 +206,57 @@ def summarise(err_text, exit_code, seconds):
     return s
 
 
+def frame_lit(shots_dir, name):
+    """Percent of the last dumped host frame that is not black, or None.
+
+    A title can present thousands of frames and show nothing: Tony Hawk's Pro
+    Skater 2X draws once per frame into a surface that never reaches the
+    screen, so it swaps at 30 fps and every pixel stays 0. Counting swaps
+    called that "renders". Looking at the pixels does not.
+
+    Black is the honest test rather than a checksum, because the failure being
+    caught is specifically "nothing arrived": a frame that is 0.0% lit is not
+    rendering whatever the swap counter says, and Burnout 2 and TimeSplitters
+    2 come back at 100% and 98% on the same measurement.
+    """
+    import struct
+    shots = sorted(shots_dir.glob(name + "*.bmp")) if shots_dir.is_dir() else []
+    if not shots:
+        return None
+    try:
+        data = shots[-1].read_bytes()
+        off = struct.unpack("<I", data[10:14])[0]
+        px = data[off:]
+        if len(px) < 3:
+            return None
+        total = len(px) // 3
+        lit = sum(1 for i in range(0, len(px) - 3, 3)
+                  if px[i:i + 3] != b"\x00\x00\x00")
+        return round(100.0 * lit / total, 1)
+    except (OSError, struct.error, IndexError):
+        return None
+
 def run_title(t, seconds, out_dir, extra_env=None):
     if not t["exe"].is_file():
         return {"verdict": "not built", "exit": None, "boot": False,
                 "device": False, "swaps": 0, "draws": 0, "draws_skipped": 0,
                 "tex_binds": 0, "tex_refused": 0, "icalls": 0, "kernel": 0,
-                "clears": 0, "seconds": None}
+                "clears": 0, "seconds": None, "lit": None}
     env = dict(os.environ)
     env.setdefault("RECOMP_VBLANK", "1")
     env.setdefault("RECOMP_AC97_READY", "1")
     # Count frames from process start rather than from the first swap.
     env.setdefault("RECOMP_FPS", "5")
+    # Swaps are not pixels. Tony Hawk's Pro Skater 2X presents 1,638 frames in
+    # a minute and every one of them is black: it draws once per frame into a
+    # surface that never reaches the screen, and this table called it
+    # "renders" for a day. Dump host frames and look at them.
+    shots = out_dir / "frames"
+    shots.mkdir(exist_ok=True)
+    for old in shots.glob(f"{t['name']}*.bmp"):
+        old.unlink()
+    env.setdefault("RECOMP_HLE_D3D8_DUMP", str(shots / t["name"]))
+    env.setdefault("RECOMP_HLE_D3D8_DUMP_EVERY", "150")
     env.update(extra_env or {})
     err_path = out_dir / f"{t['name']}.err"
     with open(err_path, "wb") as errf:
@@ -230,6 +270,11 @@ def run_title(t, seconds, out_dir, extra_env=None):
             code = "timeout"
     text = err_path.read_text(encoding="utf-8", errors="replace")
     s = summarise(text, code, seconds)
+    s["lit"] = frame_lit(shots, t["name"])
+    # Presenting frames that are entirely black is not rendering, and saying
+    # so is the whole reason this column exists.
+    if s["verdict"] == "renders" and s["lit"] == 0.0:
+        s["verdict"] = "black screen"
     s["log"] = str(err_path.relative_to(ROOT))
     return s
 
@@ -240,6 +285,7 @@ def run_title(t, seconds, out_dir, extra_env=None):
 COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher"),
            ("draws_skipped", 8, "lower"), ("tex_binds", 10, "higher"),
            ("tex_refused", 8, "lower"), ("icalls", 7, "lower"),
+           ("lit", 6, "higher"),
            ("exit", 9, None), ("kernel", 11, None)]
 
 
@@ -248,7 +294,8 @@ COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher")
 # reporting it as a regression is how a report stops being read.
 VERDICT_RANK = [
     ("build failed", 0), ("not built", 0), ("no start", 1), ("boots", 2),
-    ("no frames", 3), ("first frame late", 4), ("renders", 5),
+    ("black screen", 3), ("no frames", 3), ("first frame late", 4),
+    ("renders", 5),
 ]
 
 
