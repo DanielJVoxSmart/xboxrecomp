@@ -1702,17 +1702,47 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
 
-    static int logged = 0;
-    if (logged++ < 20) {
-        fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
-                "handle=%p timeout=%s\n",
-                STACK_ARG(0), handle, timeout_ptr ? "finite" : "INFINITE");
-        fflush(stderr);
-    }
+    static int      logged = 0;
+    static uint64_t calls  = 0;
+    static uint64_t spin_at = 1000000;
+    int             say = logged < 20;
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+
+    /* The status, not just the arguments.
+     *
+     * This logged the handle and the timeout before the call and nothing
+     * after it, so a wait that returned the same answer thirty million times
+     * looked identical in the log to one that blocked. Tony Hawk's Pro Skater
+     * 2X spins here -- its wrapper at 0x001B5735 retries whenever the status
+     * is STATUS_ALERTED -- and the log could not say which status it was
+     * getting, which is the only thing worth knowing about a wait.
+     *
+     * So: the first twenty with their result, and then one line per million
+     * calls naming the handle and the status they keep coming back with. A
+     * title in a legitimate wait makes no calls at all and prints nothing.
+     */
+    if (++calls >= spin_at) {
+        spin_at += 1000000;
+        say = 1;
+        fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: %llu calls -- "
+                "this is a spin, not a wait\n", (unsigned long long)calls);
+    }
+    if (say) {
+        logged++;
+        fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
+                "handle=%p alertable=%u timeout=%s -> 0x%08X%s\n",
+                STACK_ARG(0), handle, (unsigned)alertable,
+                timeout_ptr ? "finite" : "INFINITE", g_eax,
+                g_eax == 0x00000101u ? " (STATUS_ALERTED)"
+              : g_eax == 0x00000102u ? " (STATUS_TIMEOUT)"
+              : g_eax == 0u          ? " (signalled)"
+              : g_eax == 0xC0000001u ? " (STATUS_UNSUCCESSFUL -- bad handle?)"
+                                     : "");
+        fflush(stderr);
+    }
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
