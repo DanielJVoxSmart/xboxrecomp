@@ -244,6 +244,43 @@ def _bmp_lit(path):
         return None
 
 
+def frame_motion(shots_dir, name):
+    """How many of the captured frames differ from the one before, as a
+    percentage of the comparisons made -- or None when there are too few.
+
+    Pixels are not motion, which is the same lesson as "swaps are not pixels"
+    one step further on and was learned the same way: by getting it wrong.
+    Dino Crisis 3 was read as frozen because its indexed draw count stopped
+    moving at 153792 while it went on swapping. It had in fact moved from 3D
+    geometry to one full-screen quad per frame, and the contents of that quad
+    changed every frame. Nothing in this table could say so -- `lit` reports
+    that something is on screen and is perfectly happy with a still image --
+    so the diagnosis rested on a draw counter, which is a proxy for progress
+    and not a good one.
+
+    Comparing whole frames, because that is the question: a title at a static
+    menu scores 0 and a title playing anything scores high, and neither needs
+    a draw call to be interpreted.
+    """
+    shots = sorted(shots_dir.glob(name + "*.bmp")) if shots_dir.is_dir() else []
+    if len(shots) < 2:
+        return None
+    import hashlib
+    import struct
+    digests = []
+    for f in shots:
+        try:
+            data = f.read_bytes()
+            off = struct.unpack("<I", data[10:14])[0]
+            digests.append(hashlib.sha1(data[off:]).hexdigest())
+        except (OSError, struct.error, IndexError):
+            pass
+    if len(digests) < 2:
+        return None
+    moved = sum(1 for a, b in zip(digests, digests[1:]) if a != b)
+    return round(100.0 * moved / (len(digests) - 1), 1)
+
+
 def frame_lit(shots_dir, name):
     """Percent of the *best* dumped host frame that is not black, or None.
 
@@ -275,7 +312,7 @@ def run_title(t, seconds, out_dir, extra_env=None):
                 "device": False, "swaps": 0, "draws": 0, "draws_skipped": 0,
                 "tex_binds": 0, "tex_refused": 0, "icalls": 0, "kernel": 0,
                 "clears": 0, "seconds": None, "lit": None,
-                "shots": 0, "crashed": False}
+                "shots": 0, "motion": None, "crashed": False}
     env = dict(os.environ)
     env.setdefault("RECOMP_VBLANK", "1")
     env.setdefault("RECOMP_AC97_READY", "1")
@@ -314,6 +351,7 @@ def run_title(t, seconds, out_dir, extra_env=None):
     # window gets 6 and cannot be sampled harder; one presenting 3800 gets the
     # full 24, and a black verdict on that means something.
     s["lit"], s["shots"] = frame_lit(shots, t["name"])
+    s["motion"] = frame_motion(shots, t["name"])
     # Presenting frames that are entirely black is not rendering, and saying
     # so is the whole reason this column exists.
     if s["verdict"] == "renders" and s["lit"] == 0.0:
@@ -328,7 +366,8 @@ def run_title(t, seconds, out_dir, extra_env=None):
 COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher"),
            ("draws_skipped", 8, "lower"), ("tex_binds", 10, "higher"),
            ("tex_refused", 8, "lower"), ("icalls", 7, "lower"),
-           ("lit", 6, "higher"), ("shots", 6, None),
+           ("lit", 6, "higher"), ("motion", 7, "higher"),
+           ("shots", 6, None),
            ("exit", 9, None), ("kernel", 11, None)]
 
 
@@ -342,7 +381,8 @@ COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher")
 #   1  swaps and draws only
 #   2  lit column, from the last capture, dumped every 150 swaps
 #   3  lit from the best capture every 20 swaps, shot count, crash verdicts
-METHOD = 3
+#   4  motion: whether the picture changes between captures at all
+METHOD = 4
 
 
 # How far a title got, worst to best. A verdict change is only a regression
