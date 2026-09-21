@@ -171,8 +171,14 @@ def summarise(err_text, exit_code, seconds):
     s["boot"] = "Loaded" in err_text and "sections" in err_text
     s["device"] = ("shadow device" in err_text
                    or "Direct3D_CreateDevice" in err_text)
-    s["icalls"] = len(set(re.findall(r"unresolved (?:call |jump )?target 0x([0-9A-F]{8})",
-                                     err_text)))
+    # Both wordings. A title built before the runtime renamed this line reports
+    # the old one, and matching only the new one made the count read zero --
+    # Dino Crisis 3 showed icalls=0 in this table while its log held 4,494
+    # "Failed to resolve VA" lines, which is a clean bill of health issued to
+    # the title whose unresolved calls were the thing being looked for.
+    s["icalls"] = len(set(
+        re.findall(r"(?:unresolved (?:call |jump )?target|Failed to resolve VA) "
+                   r"0x([0-9A-Fa-f]{8})", err_text)))
     s["exit"] = exit_code
     # An NT exception code is an exit status only in the sense that the process
     # had one. TimeSplitters 2 returned 0xC0000005 and this table called it the
