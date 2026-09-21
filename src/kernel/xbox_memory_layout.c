@@ -2721,9 +2721,41 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         if (g_heap_blocks[i].addr & (alignment - 1)) {
             continue;   /* wrong alignment for this request */
         }
+        /* Hand back only what was asked for, and keep the rest available.
+         *
+         * Taking the whole block is what first-fit does if you let it, and
+         * the waste is not marginal: free a 29 MB heap, ask for 16 bytes,
+         * and the 29 MB goes with it until that 16-byte pointer is freed.
+         * Mortal Kombat: Deadly Alliance allocates and frees exactly that
+         * sized block while sizing its heaps.
+         *
+         * The remainder becomes its own free block immediately after this
+         * one. Index order is address order -- xbox_HeapFree's coalescing
+         * depends on that -- so it is inserted at i + 1 rather than appended,
+         * and the two merge back together when this block is freed.
+         *
+         * doaxbv-re (GPL-3.0) fixed the same exhaustion the same way; this is
+         * the same idea written against our block table.
+         */
+        {
+            uint32_t spare = g_heap_blocks[i].size - size;
+            /* Not worth a table entry, and a split that leaves a few bytes
+             * fragments the heap faster than it saves it. */
+            if (spare >= 64u && g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+                memmove(&g_heap_blocks[i + 2], &g_heap_blocks[i + 1],
+                        (size_t)(g_heap_block_count - i - 1)
+                            * sizeof g_heap_blocks[0]);
+                g_heap_block_count++;
+                g_heap_blocks[i + 1].addr = g_heap_blocks[i].addr + size;
+                g_heap_blocks[i + 1].size = spare;
+                g_heap_blocks[i + 1].free = 1;
+                g_heap_blocks[i].size = size;
+            }
+        }
         g_heap_blocks[i].free = 0;
         result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        memset((void *)((uintptr_t)result + g_memory_offset), 0,
+               g_heap_blocks[i].size);
         return result;
     }
 
