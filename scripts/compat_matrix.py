@@ -174,6 +174,11 @@ def summarise(err_text, exit_code, seconds):
     s["icalls"] = len(set(re.findall(r"unresolved (?:call |jump )?target 0x([0-9A-F]{8})",
                                      err_text)))
     s["exit"] = exit_code
+    # An NT exception code is an exit status only in the sense that the process
+    # had one. TimeSplitters 2 returned 0xC0000005 and this table called it the
+    # best-performing title in the library, because it rendered 98.5% of a
+    # frame before faulting and nothing looked at the code.
+    s["crashed"] = isinstance(exit_code, int) and exit_code >= 0x80000000
     s["seconds"] = seconds
     # Verdict, coarsest first: the point is to spot a title falling off a
     # rung, not to grade it.
@@ -193,7 +198,12 @@ def summarise(err_text, exit_code, seconds):
     # seconds once and at about 95 the next time, so for it the difference is
     # the whole answer rather than a footnote.
     s["swapped"] = "shadow: Swap on guest thread" in err_text
-    if s["swaps"] > 0:
+    if s["crashed"]:
+        # Said first and said loudly. How far it got before faulting is in the
+        # other columns; a fault is a regression however much of a frame
+        # arrived first, and it outranks every other thing this can report.
+        s["verdict"] = "CRASHED 0x%08X" % s["exit"]
+    elif s["swaps"] > 0:
         s["verdict"] = "renders"
     elif s["swapped"]:
         s["verdict"] = f"first frame late (>{seconds - 5}s)"
@@ -206,8 +216,30 @@ def summarise(err_text, exit_code, seconds):
     return s
 
 
+def _bmp_lit(path):
+    """Percent of one BMP that is not black, or None if it cannot be read."""
+    import struct
+    try:
+        data = path.read_bytes()
+        off = struct.unpack("<I", data[10:14])[0]
+        px = data[off:]
+        if len(px) < 3:
+            return None
+        total = len(px) // 3
+        # An all-black frame is the case this exists to catch and also the
+        # common one, so answer it with a C-speed byte count instead of three
+        # hundred thousand slice comparisons per file.
+        if px.count(0) == len(px):
+            return 0.0
+        lit = sum(1 for i in range(0, len(px) - 3, 3)
+                  if px[i:i + 3] != b"\x00\x00\x00")
+        return round(100.0 * lit / total, 1)
+    except (OSError, struct.error, IndexError):
+        return None
+
+
 def frame_lit(shots_dir, name):
-    """Percent of the last dumped host frame that is not black, or None.
+    """Percent of the *best* dumped host frame that is not black, or None.
 
     A title can present thousands of frames and show nothing: Tony Hawk's Pro
     Skater 2X draws once per frame into a surface that never reaches the
@@ -218,30 +250,26 @@ def frame_lit(shots_dir, name):
     caught is specifically "nothing arrived": a frame that is 0.0% lit is not
     rendering whatever the swap counter says, and Burnout 2 and TimeSplitters
     2 come back at 100% and 98% on the same measurement.
+
+    The best frame and not the last one, because which frame the runtime
+    happens to capture is arbitrary and a title is entitled to a black one:
+    a fade, a load, a transition between screens. "Did anything ever arrive"
+    is the question, and the maximum answers it from wherever in the run the
+    captures land -- which is what makes it safe to capture them often enough
+    for a title that only presents a hundred frames to be measured at all.
     """
-    import struct
     shots = sorted(shots_dir.glob(name + "*.bmp")) if shots_dir.is_dir() else []
-    if not shots:
-        return None
-    try:
-        data = shots[-1].read_bytes()
-        off = struct.unpack("<I", data[10:14])[0]
-        px = data[off:]
-        if len(px) < 3:
-            return None
-        total = len(px) // 3
-        lit = sum(1 for i in range(0, len(px) - 3, 3)
-                  if px[i:i + 3] != b"\x00\x00\x00")
-        return round(100.0 * lit / total, 1)
-    except (OSError, struct.error, IndexError):
-        return None
+    seen = [v for v in (_bmp_lit(f) for f in shots) if v is not None]
+    return max(seen) if seen else None
+
 
 def run_title(t, seconds, out_dir, extra_env=None):
     if not t["exe"].is_file():
         return {"verdict": "not built", "exit": None, "boot": False,
                 "device": False, "swaps": 0, "draws": 0, "draws_skipped": 0,
                 "tex_binds": 0, "tex_refused": 0, "icalls": 0, "kernel": 0,
-                "clears": 0, "seconds": None, "lit": None}
+                "clears": 0, "seconds": None, "lit": None,
+                "crashed": False}
     env = dict(os.environ)
     env.setdefault("RECOMP_VBLANK", "1")
     env.setdefault("RECOMP_AC97_READY", "1")
@@ -256,7 +284,12 @@ def run_title(t, seconds, out_dir, extra_env=None):
     for old in shots.glob(f"{t['name']}*.bmp"):
         old.unlink()
     env.setdefault("RECOMP_HLE_D3D8_DUMP", str(shots / t["name"]))
-    env.setdefault("RECOMP_HLE_D3D8_DUMP_EVERY", "150")
+    # Every 20 swaps, not 150: six of eleven titles came back with no frame
+    # captured at all, so "renders" went unverified on half the table while
+    # reading exactly like a pass. Max Payne presents around 130 frames in its
+    # window and Outrun 2 fewer, which never reached 150. The runtime caps how
+    # many files it writes, so this costs a fast title nothing.
+    env.setdefault("RECOMP_HLE_D3D8_DUMP_EVERY", "20")
     env.update(extra_env or {})
     err_path = out_dir / f"{t['name']}.err"
     with open(err_path, "wb") as errf:
@@ -293,7 +326,8 @@ COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher")
 # when the rank falls: "not built -> boots" is the opposite of one, and
 # reporting it as a regression is how a report stops being read.
 VERDICT_RANK = [
-    ("build failed", 0), ("not built", 0), ("no start", 1), ("boots", 2),
+    ("build failed", 0), ("not built", 0), ("CRASHED", 1), ("no start", 1),
+    ("boots", 2),
     ("black screen", 3), ("no frames", 3), ("first frame late", 4),
     ("renders", 5),
 ]
@@ -322,8 +356,29 @@ def counter_regressed(col, cur, was):
     return delta >= 2 and delta * 10 >= was
 
 
+def cell(col, value):
+    """One column's text.
+
+    The exit code gets printed the way it is read. A fault arrives here as
+    3221225477, which is 0xC0000005 written in the one base nobody recognises
+    it in -- and at ten digits it was also one wider than its column, so it ran
+    into the number beside it and 98.5 + 3221225477 read as a single figure.
+    That is how a crashing title was misread as the best result in the table.
+    """
+    if col == "exit" and isinstance(value, int) and value >= 0x80000000:
+        return "0x%08X" % value
+    return str(value)
+
+
 def print_table(rows, baseline=None):
+    # Width from the widest thing that will actually be printed, not from a
+    # number guessed when the column was added. Every column is declared with
+    # a minimum, every value gets at least one space in front of it, and no
+    # value can push into its neighbour whatever it turns out to be.
     widths = {c: max(w, len(c) + 1) for c, w, _ in COLUMNS}
+    for s in rows.values():
+        for col, _w, _ in COLUMNS:
+            widths[col] = max(widths[col], len(cell(col, s.get(col, 0))) + 1)
     head = f"{'title':<16}" + "".join(f"{c:>{widths[c]}}" for c, _w, _ in COLUMNS)
     print(head)
     print("-" * len(head))
@@ -333,7 +388,7 @@ def print_table(rows, baseline=None):
         line = f"{name:<16}"
         for col, _w, better in COLUMNS:
             cur = s.get(col, 0)
-            line += f"{str(cur):>{widths[col]}}"
+            line += f"{cell(col, cur):>{widths[col]}}"
             if baseline and name in baseline and better:
                 was = baseline[name].get(col, 0)
                 if isinstance(cur, int) and isinstance(was, int) and cur != was:
