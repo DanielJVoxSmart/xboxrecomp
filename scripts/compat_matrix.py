@@ -260,7 +260,7 @@ def frame_lit(shots_dir, name):
     """
     shots = sorted(shots_dir.glob(name + "*.bmp")) if shots_dir.is_dir() else []
     seen = [v for v in (_bmp_lit(f) for f in shots) if v is not None]
-    return max(seen) if seen else None
+    return (max(seen) if seen else None), len(seen)
 
 
 def run_title(t, seconds, out_dir, extra_env=None):
@@ -269,7 +269,7 @@ def run_title(t, seconds, out_dir, extra_env=None):
                 "device": False, "swaps": 0, "draws": 0, "draws_skipped": 0,
                 "tex_binds": 0, "tex_refused": 0, "icalls": 0, "kernel": 0,
                 "clears": 0, "seconds": None, "lit": None,
-                "crashed": False}
+                "shots": 0, "crashed": False}
     env = dict(os.environ)
     env.setdefault("RECOMP_VBLANK", "1")
     env.setdefault("RECOMP_AC97_READY", "1")
@@ -303,7 +303,11 @@ def run_title(t, seconds, out_dir, extra_env=None):
             code = "timeout"
     text = err_path.read_text(encoding="utf-8", errors="replace")
     s = summarise(text, code, seconds)
-    s["lit"] = frame_lit(shots, t["name"])
+    # How many frames that rests on, because 0.0 from 24 captures and 0.0
+    # from 6 are not the same claim. A title only reaching 134 swaps in its
+    # window gets 6 and cannot be sampled harder; one presenting 3800 gets the
+    # full 24, and a black verdict on that means something.
+    s["lit"], s["shots"] = frame_lit(shots, t["name"])
     # Presenting frames that are entirely black is not rendering, and saying
     # so is the whole reason this column exists.
     if s["verdict"] == "renders" and s["lit"] == 0.0:
@@ -318,8 +322,21 @@ def run_title(t, seconds, out_dir, extra_env=None):
 COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher"),
            ("draws_skipped", 8, "lower"), ("tex_binds", 10, "higher"),
            ("tex_refused", 8, "lower"), ("icalls", 7, "lower"),
-           ("lit", 6, "higher"),
+           ("lit", 6, "higher"), ("shots", 6, None),
            ("exit", 9, None), ("kernel", 11, None)]
+
+
+# Bumped whenever a change in this file alters what a verdict or a counter
+# means. Comparing across it compares two different measurements, and every
+# such comparison so far has read as a regression in the title: reading the
+# best capture instead of the last one moved Dino Crisis 3 from "black screen"
+# to "renders" and Max Payne the other way, and surfacing the exit code turned
+# TimeSplitters 2 from "renders" into a crash it had been doing all along.
+# None of those three titles changed.
+#   1  swaps and draws only
+#   2  lit column, from the last capture, dumped every 150 swaps
+#   3  lit from the best capture every 20 swaps, shot count, crash verdicts
+METHOD = 3
 
 
 # How far a title got, worst to best. A verdict change is only a regression
@@ -370,7 +387,7 @@ def cell(col, value):
     return str(value)
 
 
-def print_table(rows, baseline=None):
+def print_table(rows, baseline=None, baseline_method=None):
     # Width from the widest thing that will actually be printed, not from a
     # number guessed when the column was added. Every column is declared with
     # a minimum, every value gets at least one space in front of it, and no
@@ -382,8 +399,14 @@ def print_table(rows, baseline=None):
     head = f"{'title':<16}" + "".join(f"{c:>{widths[c]}}" for c, _w, _ in COLUMNS)
     print(head)
     print("-" * len(head))
+    # A baseline measured by an older version of this script is not a
+    # baseline, it is a different question asked of the same titles. Say so
+    # once, loudly, and keep its verdict changes out of the regression list
+    # rather than reporting the tool's own repairs as the library breaking.
+    comparable = baseline_method == METHOD
     regressions = []
     improvements = []
+    incomparable = []
     for name, s in rows.items():
         line = f"{name:<16}"
         for col, _w, better in COLUMNS:
@@ -407,7 +430,10 @@ def print_table(rows, baseline=None):
             if s.get("verdict") != before:
                 fell = verdict_rank(s.get("verdict")) < verdict_rank(before)
                 line += f"   [{'was' if fell else 'up from'} {before}]"
-                if fell:
+                if not comparable:
+                    incomparable.append(
+                        f"{name}: {before} -> {s.get('verdict')}")
+                elif fell:
                     regressions.append(
                         f"{name}: {before} -> {s.get('verdict')}")
                 else:
@@ -416,6 +442,14 @@ def print_table(rows, baseline=None):
         print(line)
     if baseline:
         print()
+        if not comparable:
+            print(f"MEASURED BY A DIFFERENT TOOL: this run is method "
+                  f"{METHOD}, the baseline method {baseline_method}. What a "
+                  f"verdict means changed between them, so a verdict that "
+                  f"moved may be this script correcting itself rather than "
+                  f"the title doing anything different. Re-run the baseline "
+                  f"before trusting any of it as a regression.")
+            print()
         windows = {r.get("seconds") for r in rows.values() if r.get("seconds")}
         was = {b.get("seconds") for b in baseline.values() if b.get("seconds")}
         if windows and was and windows != was:
@@ -429,7 +463,11 @@ def print_table(rows, baseline=None):
             for r in improvements:
                 print(f"  {r}")
             print()
-        if regressions:
+        if incomparable:
+            print("verdicts that moved (NOT comparable, see above):")
+            for r in incomparable:
+                print(f"  {r}")
+        elif regressions:
             print("REGRESSED:")
             for r in regressions:
                 print(f"  {r}")
@@ -463,12 +501,17 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     baseline = None
+    baseline_method = None
     if args.baseline:
         bp = Path(args.baseline)
         if not bp.is_absolute():
             bp = ROOT / bp
         if bp.is_file():
-            baseline = json.loads(bp.read_text(encoding="utf-8")).get("titles")
+            loaded = json.loads(bp.read_text(encoding="utf-8"))
+            baseline = loaded.get("titles")
+            # Absent means it predates the field, which is method 1 or 2 --
+            # either way not this one.
+            baseline_method = loaded.get("method")
         else:
             print(f"baseline {bp} not found; running without one", file=sys.stderr)
 
@@ -497,11 +540,12 @@ def main():
         return 0
 
     print()
-    print_table(rows, baseline)
+    print_table(rows, baseline, baseline_method)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     jpath = out_dir / f"matrix-{stamp}.json"
-    jpath.write_text(json.dumps({"seconds": args.seconds, "titles": rows},
+    jpath.write_text(json.dumps({"seconds": args.seconds,
+                                 "method": METHOD, "titles": rows},
                                 indent=1), encoding="utf-8")
     latest = out_dir / "matrix-latest.json"
     latest.write_text(jpath.read_text(encoding="utf-8"), encoding="utf-8")
