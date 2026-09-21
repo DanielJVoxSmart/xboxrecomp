@@ -50,6 +50,10 @@
 
 void hle_dsound_stream_tick(uint64_t now);   /* hle_dsound_stream.c */
 
+/* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather
+ * than including the kernel header, which this file has no other need of. */
+int xbox_EnvSwitch(const char *name, int default_on);
+
 enum {
     SET_FORMAT     = 0x0Cu,   /* tag | channels << 16 | bits << 24 */
     SET_RATE       = 0x10u,
@@ -348,6 +352,47 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
                 iface && HLE_MEM32(iface) ? setting(iface, SET_SIZE) : 0u,
                 iface && HLE_MEM32(iface) ? setting(iface, SET_RATE) : 0u, flags,
                 !b ? "not modelled" : b->output ? "output" : "clock only");
+        /* RECOMP_DSOUND_DUMP=1 -- the settings object, as words.
+         *
+         * The offsets above are one XDK's layout. When a title reports a rate
+         * of 29433088 and a format of 0x01C10D60 -- both of which are guest
+         * pointers, not a rate and a packed format -- the table is being read
+         * against a different layout, and the only way to say which is to look
+         * at what is actually there. Tony Hawk's Pro Skater 2X (XDK 3947) is
+         * the first title here to disagree with it. */
+        if (!b && xbox_EnvSwitch("RECOMP_DSOUND_DUMP", 0)) {
+            uint32_t object = (iface && guest_readable(iface, 4u))
+                            ? HLE_MEM32(iface) : 0u;
+            uint32_t voice  = (iface >= 0x0Cu && guest_readable(iface - 0x0Cu, 4u))
+                            ? HLE_MEM32(iface - 0x0Cu) : 0u;
+            unsigned w;
+            fprintf(stderr, "[DSOUND]   object=0x%08X voice=0x%08X\n",
+                    object, voice);
+            for (w = 0; w < 0x34u; w += 4u) {
+                if (object && guest_readable(object + w, 4u))
+                    fprintf(stderr, "[DSOUND]     object+%02X = %08X\n",
+                            w, HLE_MEM32(object + w));
+            }
+            for (w = 0; w < 0x20u; w += 4u) {
+                if (voice && guest_readable(voice + w, 4u))
+                    fprintf(stderr, "[DSOUND]     voice +%02X = %08X\n",
+                            w, HLE_MEM32(voice + w));
+            }
+            /* Follow whatever sits where the format and rate are expected.
+             * If this build keeps a WAVEFORMATEX pointer there, its first
+             * words read as tag | channels << 16, then samples per second. */
+            for (w = 0x0Cu; w <= 0x10u; w += 4u) {
+                uint32_t p = (voice && guest_readable(voice + w, 4u))
+                           ? HLE_MEM32(voice + w) : 0u;
+                unsigned k;
+                if (!p || !guest_readable(p, 0x18u))
+                    continue;
+                fprintf(stderr, "[DSOUND]     *(voice+%02X)=0x%08X:", w, p);
+                for (k = 0; k < 0x18u; k += 4u)
+                    fprintf(stderr, " %08X", HLE_MEM32(p + k));
+                fprintf(stderr, "\n");
+            }
+        }
         fflush(stderr);
     }
     if (!b) {
