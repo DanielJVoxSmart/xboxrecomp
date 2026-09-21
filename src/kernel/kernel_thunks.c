@@ -398,6 +398,9 @@ void xbox_kernel_init(void)
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
 
+    /* Timer base, before anything can ask for a timestamp. */
+    xbox_hal_init_timers();
+
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
     g_log_cs_init = TRUE;
