@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>   /* getenv, exit: the spin verdict below */
+#include <string.h>   /* memcpy, strcmp: the caller scan and RECOMP_ICALL_FATAL */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -238,7 +239,7 @@ void recomp_icall_fail_log(uint32_t va)
  * Rate-limited per address: a spin can produce millions of these, and the
  * useful information is which addresses occur, not how often.
  */
-void recomp_icall_not_code_log(uint32_t va)
+void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp)
 {
     /* A power of ten, because the rate limiter above only reaches this
      * function body at 1, 10, 100 ... and the verdict has to land on one of
@@ -276,16 +277,88 @@ void recomp_icall_not_code_log(uint32_t va)
     {
         /* The call site, read off the guest stack. Without it the log
          * says a wild pointer was skipped but not by whom, and the
-         * caller is the only thing that leads anywhere. */
+         * caller is the only thing that leads anywhere.
+         *
+         * It comes from the esp the dispatch macro captured, not from
+         * g_esp. The lifted call site pushes its return address onto the
+         * *local* esp and only syncs g_esp at certain points, so g_esp is
+         * stale here -- it read 0 exactly when a null target most needed
+         * explaining, which sent three rounds of Jet Set Radio Future
+         * chasing inferences instead of a call site. saved_esp is the value
+         * before that push, so the return address is the dword below it.
+         *
+         * Only for the call form. A tail jump pushes no return address, so
+         * that dword is whatever the frame happened to leave there: Tony
+         * Hawk's Pro Skater 2X reported "from 0x00000008" and then "from
+         * 0x00000004" for the same million skipped calls, and both are
+         * plainly not code. Printing a number that cannot be an address as
+         * though it were the caller is worse than printing nothing, because
+         * it is the one field a reader goes to next.
+         *
+         * So: name the form, and where the top of the stack cannot answer,
+         * scan for code-range values the way the unresolved-target logger
+         * above does. Stale return addresses from earlier frames come back
+         * too and the first is the reliable one, but a list of real code
+         * addresses is a place to start and 0x00000008 is not. */
         uint32_t caller = 0;
-        if (g_esp && g_xbox_mem_offset)
+        if (g_icall_dispatch_form != 2 && saved_esp >= 4 && g_xbox_mem_offset)
             caller = *(const uint32_t *)((const uint8_t *)g_xbox_mem_offset
-                                         + g_esp);
+                                         + (saved_esp - 4));
+        if (caller < g_xbox_code_lo || caller >= g_xbox_code_hi)
+            caller = 0;
         fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped "
-                        "%llu time(s) from 0x%08X (null or wild function "
-                        "pointer, at call #%llu)\n",
-                va, (unsigned long long)hits[i], caller,
+                        "%llu time(s) via a %s",
+                va, (unsigned long long)hits[i],
+                g_icall_dispatch_form == 2 ? "jump" : "call");
+        if (caller)
+            fprintf(stderr, " from 0x%08X", caller);
+        fprintf(stderr, " (null or wild function pointer, at call #%llu)\n",
                 (unsigned long long)g_icall_count);
+
+        /* The stack scan, once per address: the same heuristic the
+         * unresolved-target logger uses, and the only thing that names a
+         * caller when the return address is not where it should be. */
+        if (hits[i] == 1) {
+            const uint8_t *stack = (const uint8_t *)g_xbox_mem_offset
+                                 + saved_esp;
+            int shown = 0, k;
+            fprintf(stderr, "  callers:");
+            for (k = 0; g_xbox_mem_offset && saved_esp
+                        && k < 160 && shown < 6; k++) {
+                uint32_t v;
+                memcpy(&v, stack + (size_t)k * 4, sizeof v);
+                if (v >= g_xbox_code_lo && v < g_xbox_code_hi) {
+                    fprintf(stderr, "%s 0x%08X", shown ? " <-" : "", v);
+                    shown++;
+                }
+            }
+            if (!shown)
+                fprintf(stderr, " (none on the stack)");
+            fprintf(stderr, "\n");
+        }
+
+        /* RECOMP_ICALL_FATAL=1: fault here instead of skipping, so the crash
+         * handler prints the guest call stack that reached this call.
+         *
+         * The caller printed above is read from the top of the guest stack,
+         * which is right only when the lifted call site pushed a return
+         * address there and nothing has since moved esp. When it reads 0 --
+         * exactly the case where a null target most needs explaining -- the
+         * line says a wild pointer was skipped and nothing about by whom. A
+         * deliberate fault costs the run and buys the backtrace. */
+        {
+            static int fatal = -1;
+            if (fatal < 0) {
+                const char *v = getenv("RECOMP_ICALL_FATAL");
+                fatal = v && *v && strcmp(v, "0") != 0;
+            }
+            if (fatal) {
+                fprintf(stderr, "[ICALL] RECOMP_ICALL_FATAL: faulting here for "
+                                "a backtrace\n");
+                fflush(stderr);
+                *(volatile int *)0 = 1;
+            }
+        }
     }
 
     /* Past a certain count this stops being a warning and becomes a verdict.
