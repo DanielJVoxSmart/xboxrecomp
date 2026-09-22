@@ -440,6 +440,10 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    /* A spawned worker runs lifted code, so it queues behind the lock like
+     * any other guest thread. It is dropped again at its first kernel call. */
+    xbox_GuestLockEnter();
+    xbox_GuestLiftedEnter();
     xbox_NameCurrentThread(L"guest worker");
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
@@ -9837,6 +9841,7 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+            xbox_GuestConcurrencyReport();
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
@@ -9916,7 +9921,24 @@ static void kernel_thunk_dispatch(void)
          * RECOMP_ABI_CALL (it only sees esp too low), and surfaces far away as
          * callee-saved registers restored from the wrong slots. */
         uint32_t _esp_before = g_esp;
+        /* The guest lock is held across lifted code and dropped here.
+         *
+         * Every blocking call a guest thread can make goes through a bridge,
+         * so dropping around all of them means no thread ever blocks holding
+         * the lock -- which is what keeps this deadlock-free without having
+         * to enumerate which ordinals block. It also costs one uncontended
+         * acquire per kernel call, which is the price of not having to be
+         * right about that list. */
+        int _guest_held = xbox_GuestLockDrop();
+        xbox_GuestLiftedLeave();
         bridge();
+        /* Re-acquire first, then count. Counting first made a thread waiting
+         * for the lock look like a thread running lifted code, so switching
+         * the lock on -- which is meant to make overlap impossible -- took
+         * the reported overlaps from 1,625 to 8,265,550. The meter has to
+         * read zero under the lock or it is not measuring what it claims. */
+        xbox_GuestLockRestore(_guest_held);
+        xbox_GuestLiftedEnter();
         if (g_esp != _esp_before) {
             static uint8_t said[XBOX_KERNEL_THUNK_TABLE_SIZE];
             if (!said[slot]) {

@@ -312,7 +312,8 @@ def run_title(t, seconds, out_dir, extra_env=None):
                 "device": False, "swaps": 0, "draws": 0, "draws_skipped": 0,
                 "tex_binds": 0, "tex_refused": 0, "icalls": 0, "kernel": 0,
                 "clears": 0, "seconds": None, "lit": None,
-                "shots": 0, "motion": None, "crashed": False}
+                "shots": 0, "motion": None, "crashed": False,
+                "runs": "0/0"}
     env = dict(os.environ)
     env.setdefault("RECOMP_VBLANK", "1")
     env.setdefault("RECOMP_AC97_READY", "1")
@@ -360,6 +361,41 @@ def run_title(t, seconds, out_dir, extra_env=None):
     return s
 
 
+def run_repeated(t, seconds, out_dir, repeat):
+    """Run a title `repeat` times and report the worst run, plus the spread.
+
+    One run per title is only honest for a title that behaves the same way
+    every time, and at least one does not: TimeSplitters 2 faults about half
+    the runs, so a single sample reports "renders" or "CRASHED 0xC0000005"
+    with equal confidence and no way to tell which is the title. That produced
+    three wrong conclusions in two days -- a regression pair that was the tool
+    changing, an exit code dismissed as a one-off, and a crash declared fixed
+    by a merge when five clean runs in a row had simply been luck.
+
+    The worst run, because a title that crashes half the time has a crash, and
+    reporting the good half hides it. `runs` carries the detail the verdict
+    cannot: "2/5" against a crash verdict says flaky, "5/5" says broken, and
+    those want different work.
+    """
+    if repeat <= 1:
+        s = run_title(t, seconds, out_dir)
+        s["runs"] = "1/1"
+        return s
+
+    results = [run_title(t, seconds, out_dir) for _ in range(repeat)]
+    worst = min(results, key=lambda r: verdict_rank(r.get("verdict")))
+    same = sum(1 for r in results
+               if verdict_rank(r.get("verdict"))
+               == verdict_rank(worst.get("verdict")))
+    worst["runs"] = f"{same}/{repeat}"
+    # Keep the best lit/motion seen: a title that rendered once can render.
+    for key in ("lit", "motion"):
+        seen = [r.get(key) for r in results if r.get(key) is not None]
+        if seen:
+            worst[key] = max(seen)
+    return worst
+
+
 # (name, minimum width, which direction is better). The width is widened to
 # the header itself below, because a column narrower than its own name runs
 # into the next one and the table stops being readable.
@@ -367,7 +403,7 @@ COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher")
            ("draws_skipped", 8, "lower"), ("tex_binds", 10, "higher"),
            ("tex_refused", 8, "lower"), ("icalls", 7, "lower"),
            ("lit", 6, "higher"), ("motion", 7, "higher"),
-           ("shots", 6, None),
+           ("shots", 6, None), ("runs", 6, None),
            ("exit", 9, None), ("kernel", 11, None)]
 
 
@@ -524,6 +560,11 @@ def print_table(rows, baseline=None, baseline_method=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="run each title N times and report the worst, with "
+                         "how many runs agreed. Anything below 5 cannot see a "
+                         "fault that happens half the time, which is the rate "
+                         "TimeSplitters 2 actually faults at")
     ap.add_argument("--seconds", type=int, default=45,
                     help="how long to run each title (default 45)")
     ap.add_argument("--titles", help="comma-separated subset")
@@ -578,7 +619,7 @@ def main():
         if args.no_run:
             continue
         t0 = time.time()
-        rows[t["name"]] = run_title(t, args.seconds, out_dir)
+        rows[t["name"]] = run_repeated(t, args.seconds, out_dir, args.repeat)
         print(f"{prefix} {rows[t['name']]['verdict']} "
               f"({time.time() - t0:.0f}s)", flush=True)
 
@@ -590,7 +631,7 @@ def main():
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     jpath = out_dir / f"matrix-{stamp}.json"
-    jpath.write_text(json.dumps({"seconds": args.seconds,
+    jpath.write_text(json.dumps({"seconds": args.seconds, "repeat": args.repeat,
                                  "method": METHOD, "titles": rows},
                                 indent=1), encoding="utf-8")
     latest = out_dir / "matrix-latest.json"
