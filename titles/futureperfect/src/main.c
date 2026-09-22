@@ -1,5 +1,5 @@
 /**
- * TimeSplitters 2 - Recompiled Game Entry Point
+ * Timesplitters - Future Perfect - Recompiled Game Entry Point
  *
  * This is the Windows executable that hosts the recompiled game code.
  * It performs the following initialization sequence:
@@ -21,7 +21,7 @@
  *   - Customize the VEH handler for game-specific crash diagnosis
  *
  * XBE Details (fill in from xbe_parser output):
- *   Title:       TimeSplitters 2
+ *   Title:       Timesplitters - Future Perfect
  *   Title ID:    0x00000000
  *   Base addr:   0x00010000
  *   Entry point: 0x00000000
@@ -81,12 +81,12 @@ extern ptrdiff_t g_xbox_mem_offset;
  * TODO: Set these from your xbe_parser output.
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
-#define YOUR_GAME_ENTRY_POINT   0x001CF3C9  /* XBE entry point VA */
+#define YOUR_GAME_ENTRY_POINT   0x0038024D  /* XBE entry point VA */
 /* Relative to the executable's own directory, titles/<title>/build/<Config>/,
  * which is where scripts/run_and_report.py starts it. Run it from there by
  * hand too, or the XBE is not found. */
-#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\Time Splitters 2\\default.xbe"
-#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\Time Splitters 2"
+#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\Timesplitters - Future Perfect\\default.xbe"
+#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\Timesplitters - Future Perfect"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -512,7 +512,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== TimeSplitters 2 - Static Recompilation ===\n");
+    printf("=== Timesplitters - Future Perfect - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
@@ -538,7 +538,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                      "Looked for:\n%s", tried);
             fprintf(stderr, "%s\n", message);
             log_hint(message, sizeof message);
-            MessageBoxA(NULL, message, "TimeSplitters 2", MB_ICONERROR);
+            MessageBoxA(NULL, message, "Timesplitters - Future Perfect", MB_ICONERROR);
             return 1;
         }
         printf("Game files: %s\n", g_game_dir);
@@ -547,7 +547,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                      "Found the game at\n%s\nbut could not read default.xbe.",
                      g_game_dir);
             log_hint(message, sizeof message);
-            MessageBoxA(NULL, message, "TimeSplitters 2", MB_ICONERROR);
+            MessageBoxA(NULL, message, "Timesplitters - Future Perfect", MB_ICONERROR);
             return 1;
         }
     }

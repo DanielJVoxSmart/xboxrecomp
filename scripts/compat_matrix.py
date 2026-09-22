@@ -335,6 +335,30 @@ def fresh_save_data(game_dir, enabled=True):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     aside = game_dir / f"UDATA.matrix-aside-{stamp}"
     moved = False
+
+    # Put back anything a previous run failed to restore, before doing
+    # anything else.
+    #
+    # A restore can fail because Windows holds the directory until the title
+    # process is fully gone. When that happened the next run found no UDATA at
+    # all, so it moved nothing aside, and the player's profiles stayed under
+    # the old aside name while the title made fresh ones -- one failure turned
+    # into the saves being quietly displaced for every run after it. Healing
+    # first makes a failed restore cost one run instead of all of them.
+    for stale in sorted(game_dir.glob("UDATA.matrix-aside-*")):
+        try:
+            if live.is_dir():
+                scratch = ROOT / "games" / "_pipeline" / "_matrix" / "udata-scratch"
+                scratch.mkdir(parents=True, exist_ok=True)
+                dest = scratch / f"{game_dir.name}-orphan-{stale.name[-15:]}"
+                if not dest.exists():
+                    live.rename(dest)
+            if not live.exists():
+                stale.rename(live)
+                print(f"   recovered save data left behind by an earlier run:"
+                      f" {stale.name} -> UDATA")
+        except OSError:
+            pass
     try:
         if live.is_dir():
             if aside.exists():
@@ -348,13 +372,32 @@ def fresh_save_data(game_dir, enabled=True):
     finally:
         if moved:
             scratch = ROOT / "games" / "_pipeline" / "_matrix" / "udata-scratch"
-            if live.is_dir():
-                scratch.mkdir(parents=True, exist_ok=True)
-                dest = scratch / f"{game_dir.name}-{stamp}"
-                if not dest.exists():
-                    live.rename(dest)
-            if not live.exists():
-                aside.rename(live)
+            # Windows keeps a directory locked until the process that was
+            # using it has fully gone, and killing a title does not make that
+            # instant. The first version of this renamed once and gave up on
+            # the exception, which left a player's save profiles sitting under
+            # the aside name with nothing in UDATA -- exactly the outcome the
+            # whole move-aside dance exists to avoid.
+            #
+            # So retry, and if it still cannot be put back, say so loudly and
+            # name the directory to rename by hand. Never silent, and never
+            # deleted.
+            for attempt in range(40):          # ~10s
+                try:
+                    if live.is_dir():
+                        scratch.mkdir(parents=True, exist_ok=True)
+                        dest = scratch / f"{game_dir.name}-{stamp}"
+                        if not dest.exists():
+                            live.rename(dest)
+                    if not live.exists():
+                        aside.rename(live)
+                    break
+                except OSError:
+                    time.sleep(0.25)
+            if not live.exists() and aside.exists():
+                print(f"!! COULD NOT RESTORE SAVE DATA for {game_dir.name}."
+                      f" Rename {aside} back to {live} by hand."
+                      f" Nothing has been deleted.", file=sys.stderr)
 
 
 def default_input_seq(seconds):
@@ -638,11 +681,19 @@ def print_table(rows, baseline=None, baseline_method=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--keep-saves", action="store_true",
-                    help="leave each title's UDATA in place. By default it is "
-                         "moved aside for the run and put back afterwards, so "
-                         "a driven run meets a first-time front end instead of "
-                         "an overwrite prompt. Nothing is ever deleted")
+    ap.add_argument("--fresh-saves", action="store_true",
+                    help="move each title's UDATA aside for the run so a "
+                         "driven run meets a first-time front end instead of "
+                         "an overwrite prompt, and put it back afterwards. "
+                         "OFF by default: Windows holds the directory until "
+                         "the title process is fully gone, the restore can "
+                         "therefore fail, and a failed restore leaves a "
+                         "player's profiles under an aside name while the "
+                         "title makes fresh ones. That happened twice in one "
+                         "afternoon. Nothing is ever deleted either way, but "
+                         "not touching save data is the safer default and the "
+                         "overwrite prompt is a smaller problem than losing "
+                         "track of someone's saves")
     ap.add_argument("--idle", action="store_true",
                     help="do not press anything. The old behaviour, and worth "
                          "having: TimeSplitters 2 crashes 10/10 idle and 0/10 "
@@ -711,7 +762,7 @@ def main():
         if not args.idle:
             t["input_seq"] = TITLE_INPUT.get(t["name"],
                                              default_input_seq(args.seconds))
-        t["fresh_saves"] = not args.keep_saves
+        t["fresh_saves"] = args.fresh_saves
         rows[t["name"]] = run_repeated(t, args.seconds, out_dir, args.repeat)
         print(f"{prefix} {rows[t['name']]['verdict']} "
               f"({time.time() - t0:.0f}s)", flush=True)

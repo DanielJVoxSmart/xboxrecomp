@@ -3733,15 +3733,25 @@ static void bridge_NtReadFile(void)
          * read, then sleeps until the routine fires, would wait forever if it
          * were told the read was still pending. XAPI's ReadFile passes no
          * routine, which is the path Burnout 2's stream reader uses. */
-        fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> %s\n",
-                STACK_ARG(1), STACK_ARG(2),
-                STACK_ARG(2) ? "completed now" : "pending");
+        if (!STACK_ARG(2) && !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
+            g_eax = 0x00000103u;           /* STATUS_PENDING */
+
+        /* The status actually returned, not a guess from the APC argument.
+         *
+         * This line said "pending" whenever there was no APC, whatever the
+         * call returned, so RECOMP_FILE_SYNC -- whose entire job is to stop
+         * returning STATUS_PENDING -- made no visible difference and looked
+         * like it had no effect. TimeSplitters: Future Perfect terminates its
+         * loader thread with exit status 0x103, which is STATUS_PENDING, so
+         * whether this call is the source of that is exactly the question
+         * the log has to be able to answer. */
+        fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> 0x%08X%s\n",
+                STACK_ARG(1), STACK_ARG(2), g_eax,
+                g_eax == 0x00000103u ? " STATUS_PENDING" : "");
         /* RECOMP_FILE_SYNC=1 reports the read finished, for a title whose
          * loader does not come back for the result. Burnout 2 needs the
          * opposite -- its stream reader only accepts a short count on the
          * pending path -- so this is a switch, not a change. */
-        if (!STACK_ARG(2) && !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
-            g_eax = 0x00000103u;           /* STATUS_PENDING */
     }
 }
 
@@ -4400,11 +4410,52 @@ static void bridge_ObReferenceObjectByHandle(void)
     HANDLE   host       = bridge_resolve_handle(handle);
     uint32_t disp       = 0;
     int      kind       = BRIDGE_OBJ_UNKNOWN;
+    uint32_t *slot_disp = NULL;
+
+    /* Handles that are not in the table still get an object.
+     *
+     * NtCurrentThread is (HANDLE)-2 and NtCurrentProcess (HANDLE)-1, and
+     * ObReferenceObjectByHandle(NtCurrentThread, ...) is an ordinary thing
+     * for a title to do -- TimeSplitters: Future Perfect does it during
+     * start-up. Those are pseudo-handles, so they are never in the handle
+     * table, and answering STATUS_INVALID_HANDLE for them is a regression
+     * this function introduced: before it returned success with a NULL
+     * object, which was wrong in a different way but which a title asking
+     * about itself could survive.
+     *
+     * So: synthesise a header for any handle, tagged or not, and keep the
+     * signal state honest by simply not claiming to know it for the ones
+     * whose kind was never recorded. A small side table, because pseudo-
+     * handles have no slot to hang it off. */
+    {
+        enum { PSEUDO_MAX = 16 };
+        static uint32_t pseudo_handle[PSEUDO_MAX];
+        static uint32_t pseudo_disp[PSEUDO_MAX];
+        static int pseudo_count;
+        int i;
+        if ((handle & 0xFF000000u) != BRIDGE_HANDLE_TAG && handle) {
+            for (i = 0; i < pseudo_count; i++)
+                if (pseudo_handle[i] == handle)
+                    break;
+            if (i == pseudo_count && pseudo_count < PSEUDO_MAX) {
+                pseudo_handle[pseudo_count] = handle;
+                pseudo_disp[pseudo_count] = 0;
+                pseudo_count++;
+            }
+            if (i < PSEUDO_MAX && pseudo_handle[i] == handle) {
+                slot_disp = &pseudo_disp[i];
+                disp = *slot_disp;
+            }
+        }
+    }
 
     if ((handle & 0xFF000000u) == BRIDGE_HANDLE_TAG && slot < BRIDGE_HANDLE_MAX) {
         kind = s_handle_kind[slot];
         disp = s_handle_dispatcher[slot];
-        if (!disp && host) {
+        slot_disp = &s_handle_dispatcher[slot];
+    }
+    {
+        if (!disp && slot_disp) {
             /* DISPATCHER_HEADER is 16 bytes: Type, Absolute, Size, Inserted,
              * LONG SignalState, LIST_ENTRY WaitListHead. Allocate a little
              * more so a caller reading a KEVENT or a KTHREAD prologue past
@@ -4417,7 +4468,7 @@ static void bridge_ObReferenceObjectByHandle(void)
                  * whatever zero happens to address. */
                 BRIDGE_MEM32(disp + 8) = disp + 8;
                 BRIDGE_MEM32(disp + 12) = disp + 8;
-                s_handle_dispatcher[slot] = disp;
+                *slot_disp = disp;
             }
         }
     }
@@ -4448,6 +4499,7 @@ static void bridge_ObReferenceObjectByHandle(void)
     }
 
     if (object_ptr) BRIDGE_MEM32(object_ptr) = disp;
+    /* Only a handle we can make nothing of at all is invalid. */
     g_eax = disp ? 0 : (uint32_t)0xC0000008u;   /* STATUS_INVALID_HANDLE */
 }
 
