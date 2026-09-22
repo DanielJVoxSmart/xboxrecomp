@@ -215,10 +215,18 @@ static Buffer *find(uint32_t iface)
 }
 
 /* The buffer's model, created or refreshed from the settings object. NULL when
- * nothing about it can be clocked (no rate or alignment worth trusting). */
-static Buffer *model_for(uint32_t iface, uint64_t now)
+ * nothing about it can be clocked (no rate or alignment worth trusting).
+ *
+ * `known` is the buffer if the caller already has it, else NULL to look it up.
+ * DirectSoundDoWork walks all 256 slots and used to pass only the iface, so
+ * every active buffer cost another full scan to find the slot the loop was
+ * already standing on -- 256 slots squared, every call, on a function the
+ * title calls far more often than once a frame. It was 22.7% of Dino Crisis
+ * 3's on-CPU time as a leaf, which is the shape of a scan rather than of the
+ * work it was meant to be doing. */
+static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
 {
-    Buffer *b = find(iface);
+    Buffer *b = known ? known : find(iface);
     uint32_t size, data, format, tag, channels, bits, align, rate, loop_start;
     uint32_t decoded_size, decoded_loop, block_align;
     int output;
@@ -317,6 +325,11 @@ static Buffer *model_for(uint32_t iface, uint64_t now)
         }
     }
     return NULL;
+}
+
+static Buffer *model_for(uint32_t iface, uint64_t now)
+{
+    return model_for_known(NULL, iface, now);
 }
 
 static uint64_t now_ms(void) { return GetTickCount64(); }
@@ -551,10 +564,31 @@ HLE_EXPORT(DirectSoundDoWork)
                         "run on the host clock and play through XAudio2\n");
         fflush(stderr);
     }
+    /* How often the title asks. On the console this is a once-a-frame call;
+     * anything wildly above the frame rate means the work below is being paid
+     * for at a rate nobody chose, and that is worth seeing in the log rather
+     * than inferring from a profile. */
+    {
+        /* Powers of ten, like the ICALL loggers, because a fixed interval
+         * is a bug here: at 100,000 this printed 688 lines in 85 seconds
+         * and NtWriteFile became 100% of the sampling profile -- the
+         * counter measuring the problem became the problem. The
+         * progression is the useful part anyway. The title calls this
+         * 68.8 million times in 85 seconds, about 62,000 per presented
+         * frame; on the console it is a once-a-frame call. */
+        static uint64_t calls, next = 1;
+        if (++calls >= next) {
+            next *= 10;
+            fprintf(stderr, "[DSOUND] DirectSoundDoWork called %llu time(s)\n",
+                    (unsigned long long)calls);
+            fflush(stderr);
+        }
+    }
     lock();
     for (i = 0; i < SLOTS; i++) {
         if (g_buffers[i].iface != 0u) {
-            Buffer *b = model_for(g_buffers[i].iface, now);
+            Buffer *b = model_for_known(&g_buffers[i],
+                                        g_buffers[i].iface, now);
             if (b)
                 pump(b, now);
         }
