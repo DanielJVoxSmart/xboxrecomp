@@ -124,6 +124,40 @@ static void test_predicates(void)
     CHECK("not depth R32F",   !d3d8_format_is_depth(D3DFMT_R32F));
 }
 
+/* Linear formats are the ones addressed in texels rather than in normalised
+   coordinates, so this predicate decides whether a stage's texture coordinates
+   are divided by the texture's size before the sample (d3d-translation.md,
+   "Linear Textures Are Addressed in Texels"). A format wrongly called linear
+   shrinks that stage's coordinates into one texel; one wrongly called swizzled
+   leaves them in pixels and samples off the edge, which is how TimeSplitters 2
+   lost two thirds of its light. Both failures are silent, so the boundaries of
+   the range are worth pinning. */
+static void test_linear_classification(void)
+{
+    printf("test_linear_classification\n");
+    /* The frame buffer TimeSplitters 2 samples, and its neighbours. */
+    CHECK("linear LIN_A8R8G8B8",  d3d8_format_is_linear(D3DFMT_LIN_A8R8G8B8) == 1);
+    CHECK("linear LIN_A1R5G5B5",  d3d8_format_is_linear(D3DFMT_LIN_A1R5G5B5) == 1);
+    CHECK("linear LIN_A8L8",      d3d8_format_is_linear(D3DFMT_LIN_A8L8) == 1);
+    CHECK("linear LIN_R8G8B8A8",  d3d8_format_is_linear(D3DFMT_LIN_R8G8B8A8) == 1);
+    CHECK("linear LIN_A8",        d3d8_format_is_linear(D3DFMT_LIN_A8) == 1);
+    CHECK("linear LIN_D24S8",     d3d8_format_is_linear(D3DFMT_LIN_D24S8) == 1);
+    CHECK("linear LIN_R32F",      d3d8_format_is_linear(D3DFMT_LIN_R32F) == 1);
+    /* Swizzled: normalised, and the swizzled predicate is defined as its
+       complement for everything that is not compressed or depth. */
+    CHECK("not linear A8R8G8B8",  d3d8_format_is_linear(D3DFMT_A8R8G8B8) == 0);
+    CHECK("not linear R32F",      d3d8_format_is_linear(D3DFMT_R32F) == 0);
+    /* Compressed and depth are not swizzled either, but they are normalised,
+       so they must not come back linear. */
+    CHECK("not linear DXT1",      d3d8_format_is_linear(D3DFMT_DXT1) == 0);
+    CHECK("not linear DXN",       d3d8_format_is_linear(D3DFMT_DXN) == 0);
+    CHECK("not linear D24S8",     d3d8_format_is_linear(D3DFMT_D24S8) == 0);
+    CHECK("not linear D32",       d3d8_format_is_linear(D3DFMT_D32) == 0);
+    /* The gaps inside the LIN_ range are not linear formats at all. */
+    CHECK("not linear 0x19",      d3d8_format_is_linear(0x19) == 0);
+    CHECK("not linear 0x1A",      d3d8_format_is_linear(0x1A) == 0);
+}
+
 static void test_swizzle_classification(void)
 {
     printf("test_swizzle_classification\n");
@@ -392,6 +426,7 @@ int main(void)
     test_bpp();
     test_predicates();
     test_swizzle_classification();
+    test_linear_classification();
     test_unswizzle_roundtrip();
     test_swizzle_offset();
     test_dxt_decode();

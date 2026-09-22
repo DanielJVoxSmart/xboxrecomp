@@ -1,5 +1,29 @@
 # The frame brightness investigation, and the tools it left behind
 
+> **Closed 22 September 2026. The bug is fixed.**
+>
+> The NV2A addresses linear (unswizzled) textures in texels rather than in
+> normalised [0,1] coordinates. The title samples its frame buffer, which is
+> `X_D3DFMT_LIN_A8R8G8B8`, and so passes coordinates in pixels -- its vertex
+> program multiplies the UVs by `c[11] = (640, 480, 1, 1)` to produce them.
+> D3D11 samples only in normalised coordinates, so every one of those samples
+> landed outside the texture and came back black, and the passes multiplied the
+> frame down by their own alpha instead of blending a copy of it back over
+> itself. The fix normalises the coordinates of any stage holding a linear
+> texture, in both pixel-shader paths. Snow level, driven session: 20.3 -> 53.5
+> of 255. See section 1 of `timesplitters2-open-issues.md` for the full
+> account.
+>
+> **The lesson worth keeping from this document** is the one it did not reach:
+> every probe here interrogates the *resource* -- is the copy arriving, is the
+> right texture bound -- and the answer was yes to all of them while the sample
+> was still zero. `RECOMP_D3D8_PS_SHOW=t0lod` now renders `Sample` beside
+> `Load` in one draw, which is the question none of the tools below could ask.
+>
+> What follows is the handover as it was written, unchanged.
+
+---
+
 Parked 20 September 2026, on branch `feat/upstream-lifter-fixes`.
 
 This is a handover. The brightness bug is **not fixed**; it is isolated,
