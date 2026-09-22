@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "launcher_theme.h"
+#include "launcher_bindings.h"
 #include "recomp_config.h"
 
 #ifndef LAUNCHER_GAME_EXE
@@ -62,6 +63,22 @@ static int            g_wide_camera;       /* hor_plus as a switch, see below */
 
 static Row  g_video_rows[8];
 static int  g_video_count;
+
+/* ---- input ---- */
+
+static BindConfig g_bind;
+static int        g_bind_port;          /* 0..3, the controller being edited */
+static int        g_bind_top;           /* first control shown: the list scrolls */
+static int        g_bind_col;           /* 0 pad, 1 keyboard */
+static int        g_capturing;          /* waiting for a press to bind */
+static int        g_capture_armed;      /* everything released since we started */
+static int        g_bind_dirty;
+
+/* Which row of whichever list is showing. Declared here rather than with
+ * the rest of the window state because the capture below reads it. */
+static int        g_sel;
+
+#define BIND_ROWS_VISIBLE 5
 
 static const char *frame_cap_label(int i)
 {
@@ -216,6 +233,133 @@ static void read_title(void)
     }
 }
 
+/* ------------------------------------------------------------- capture */
+
+/* What is pressed right now, as a source string, or NULL. Reads the pad
+ * and the keyboard together: which one a person reaches for is the
+ * answer to "what do you want this to be", and asking them to say first
+ * is a question with no purpose.
+ *
+ * Sticks count as four directions rather than two axes, because that is
+ * what the file binds and what a person means when they push one. */
+static const char *capture_pad(int pad_index)
+{
+    static char out[BIND_SOURCE_LEN];
+    XINPUT_STATE st;
+    static const struct { WORD mask; const char *name; } k_buttons[] = {
+        { XINPUT_GAMEPAD_A, "a" }, { XINPUT_GAMEPAD_B, "b" },
+        { XINPUT_GAMEPAD_X, "x" }, { XINPUT_GAMEPAD_Y, "y" },
+        { XINPUT_GAMEPAD_LEFT_SHOULDER, "lshoulder" },
+        { XINPUT_GAMEPAD_RIGHT_SHOULDER, "rshoulder" },
+        { XINPUT_GAMEPAD_START, "start" }, { XINPUT_GAMEPAD_BACK, "back" },
+        { XINPUT_GAMEPAD_LEFT_THUMB, "lthumb" },
+        { XINPUT_GAMEPAD_RIGHT_THUMB, "rthumb" },
+        { XINPUT_GAMEPAD_DPAD_UP, "dpad_up" },
+        { XINPUT_GAMEPAD_DPAD_DOWN, "dpad_down" },
+        { XINPUT_GAMEPAD_DPAD_LEFT, "dpad_left" },
+        { XINPUT_GAMEPAD_DPAD_RIGHT, "dpad_right" },
+        { 0, NULL }
+    };
+    const SHORT push = 22000;             /* well past any resting stick */
+    int i;
+
+    memset(&st, 0, sizeof st);
+    if (XInputGetState((DWORD)pad_index, &st) != ERROR_SUCCESS)
+        return NULL;
+
+    for (i = 0; k_buttons[i].name; i++)
+        if (st.Gamepad.wButtons & k_buttons[i].mask) {
+            snprintf(out, sizeof out, "pad:%s", k_buttons[i].name);
+            return out;
+        }
+    if (st.Gamepad.bLeftTrigger > 160)  { snprintf(out, sizeof out, "pad:lt"); return out; }
+    if (st.Gamepad.bRightTrigger > 160) { snprintf(out, sizeof out, "pad:rt"); return out; }
+
+    if (st.Gamepad.sThumbLX >  push) { snprintf(out, sizeof out, "pad:lx+"); return out; }
+    if (st.Gamepad.sThumbLX < -push) { snprintf(out, sizeof out, "pad:lx-"); return out; }
+    if (st.Gamepad.sThumbLY >  push) { snprintf(out, sizeof out, "pad:ly+"); return out; }
+    if (st.Gamepad.sThumbLY < -push) { snprintf(out, sizeof out, "pad:ly-"); return out; }
+    if (st.Gamepad.sThumbRX >  push) { snprintf(out, sizeof out, "pad:rx+"); return out; }
+    if (st.Gamepad.sThumbRX < -push) { snprintf(out, sizeof out, "pad:rx-"); return out; }
+    if (st.Gamepad.sThumbRY >  push) { snprintf(out, sizeof out, "pad:ry+"); return out; }
+    if (st.Gamepad.sThumbRY < -push) { snprintf(out, sizeof out, "pad:ry-"); return out; }
+    return NULL;
+}
+
+/* The key names the runtime knows by name; everything else is a letter
+ * or a digit and spells itself. Escape is not offered: it is how a
+ * person gets out of the capture. */
+static const struct { int vk; const char *name; } k_named_keys[] = {
+    { VK_RETURN, "RETURN" }, { VK_BACK, "BACK" }, { VK_SPACE, "SPACE" },
+    { VK_TAB, "TAB" }, { VK_UP, "UP" }, { VK_DOWN, "DOWN" },
+    { VK_LEFT, "LEFT" }, { VK_RIGHT, "RIGHT" },
+    { VK_LSHIFT, "LSHIFT" }, { VK_RSHIFT, "RSHIFT" },
+    { VK_LCONTROL, "LCTRL" }, { VK_RCONTROL, "RCTRL" },
+    { 0, NULL }
+};
+
+static const char *capture_key(void)
+{
+    static char out[BIND_SOURCE_LEN];
+    int i, vk;
+
+    for (i = 0; k_named_keys[i].name; i++)
+        if (GetAsyncKeyState(k_named_keys[i].vk) & 0x8000) {
+            snprintf(out, sizeof out, "key:%s", k_named_keys[i].name);
+            return out;
+        }
+    for (vk = 'A'; vk <= 'Z'; vk++)
+        if (GetAsyncKeyState(vk) & 0x8000) {
+            snprintf(out, sizeof out, "key:%c", (char)vk);
+            return out;
+        }
+    for (vk = '0'; vk <= '9'; vk++)
+        if (GetAsyncKeyState(vk) & 0x8000) {
+            snprintf(out, sizeof out, "key:%c", (char)vk);
+            return out;
+        }
+    return NULL;
+}
+
+/* Nothing at all held. Entering the capture with A still down would
+ * otherwise bind A to whatever the person was trying to rebind. */
+static int everything_released(int pad_index)
+{
+    return capture_pad(pad_index) == NULL && capture_key() == NULL &&
+           !(GetAsyncKeyState(VK_ESCAPE) & 0x8000);
+}
+
+static void capture_tick(void)
+{
+    const BindPort *bp = &g_bind.port[g_bind_port];
+    int pad = bp->device == BIND_DEV_XINPUT ? bp->pad : 0;
+    const char *got;
+
+    if (!g_capture_armed) {
+        g_capture_armed = everything_released(pad);
+        return;
+    }
+    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+        g_capturing = 0;
+        return;
+    }
+    got = (g_bind_col == 0) ? capture_pad(pad) : capture_key();
+    if (!got)
+        return;
+
+    {
+        int k = g_bind_top + g_sel;
+
+        if (k >= 0 && k < BIND_CONTROLS) {
+            char *dst = (g_bind_col == 0) ? g_bind.port[g_bind_port].pad_src[k]
+                                          : g_bind.port[g_bind_port].key_src[k];
+            snprintf(dst, BIND_SOURCE_LEN, "%s", got);
+            g_bind_dirty = 1;
+        }
+    }
+    g_capturing = 0;
+}
+
 /* ------------------------------------------------------------ persistence */
 
 static void settings_load(void)
@@ -236,6 +380,25 @@ static void settings_load(void)
                 break;
             }
     }
+}
+
+static void bindings_load(void)
+{
+    char path[1024];
+
+    bind_defaults(&g_bind);
+    if (bind_config_path(path, sizeof path))
+        bind_load(path, &g_bind);
+    g_bind_dirty = 0;
+}
+
+static void bindings_save(void)
+{
+    char path[1024];
+
+    if (g_bind_dirty && bind_config_path(path, sizeof path))
+        if (bind_save(path, &g_bind))
+            g_bind_dirty = 0;
 }
 
 static int settings_save(void)
@@ -370,7 +533,6 @@ static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "INPUT", "ABOUT" };
 static Tab    g_tab;
 static Tab    g_tab_from;
 static double g_tab_t = 1.0;
-static int    g_sel;
 static int    g_rows_on_tab;
 static double g_pulse;
 static int    g_pad_seen;
@@ -408,7 +570,8 @@ static void set_tab(Tab t)
 
 static void rows_for_tab(void)
 {
-    g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count : 0;
+    g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count
+                  : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE : 0;
     if (g_sel >= g_rows_on_tab)
         g_sel = g_rows_on_tab ? g_rows_on_tab - 1 : 0;
 }
@@ -416,14 +579,54 @@ static void rows_for_tab(void)
 static void do_play(void)
 {
     settings_save();
+    bindings_save();
     if (launch_game())
         PostMessage(g_hwnd, WM_CLOSE, 0, 0);
 }
 
+/* The input list is longer than the screen, so moving off either end
+ * scrolls it rather than wrapping: a list that wraps from "A" to "right
+ * stick press" is a list nobody can walk down. */
+static void input_move(int dy)
+{
+    int k = g_bind_top + g_sel + dy;
+
+    if (k < 0) k = 0;
+    if (k >= BIND_CONTROLS) k = BIND_CONTROLS - 1;
+    if (k < g_bind_top)
+        g_bind_top = k;
+    else if (k >= g_bind_top + BIND_ROWS_VISIBLE)
+        g_bind_top = k - BIND_ROWS_VISIBLE + 1;
+    g_sel = k - g_bind_top;
+}
+
 static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
 {
+    if (g_capturing) {
+        /* While waiting for a press, nothing else means anything: the
+         * press is the answer. Cancel is handled in capture_tick, which
+         * watches Escape and the pad together. */
+        if (cancel)
+            g_capturing = 0;
+        return;
+    }
     if (tabdelta)
         set_tab((Tab)((g_tab + tabdelta + TAB_COUNT) % TAB_COUNT));
+
+    if (g_tab == TAB_INPUT) {
+        if (dy)
+            input_move(dy);
+        if (dx)
+            g_bind_col = g_bind_col ? 0 : 1;
+        if (accept) {
+            g_capturing = 1;
+            g_capture_armed = 0;        /* wait for the accept to be let go */
+        }
+        if (cancel)
+            PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+
     if (dy && g_rows_on_tab)
         g_sel = (g_sel + dy + g_rows_on_tab) % g_rows_on_tab;
     if (dx && g_tab == TAB_VIDEO && g_rows_on_tab)
@@ -488,17 +691,97 @@ static void draw(void)
         if (g_sel < g_video_count)
             theme_text(r, g_video_rows[g_sel].help, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
     } else if (g_tab == TAB_INPUT) {
-        ThemeRect p = row_rect(0);
+        BindPort *bp = &g_bind.port[g_bind_port];
+        ThemeRect hdr = row_rect(0);
+        char line[160];
+        int i;
 
-        p.h = 150;
-        theme_panel(p, 0.25);
-        p.x += 24; p.y += 20; p.w -= 48; p.h = 30;
-        theme_text(p, "Controller and keyboard bindings", 14, 700,
-                   THEME_TEXT, THEME_LEFT);
-        p.y += 34; p.h = 90;
-        theme_text_wrapped(p,
-            "Not here yet. Bindings live in a file shared by every game the "
-            "toolkit builds, and are edited with:  py -3 -m tools.input_ui",
+        /* Which controller, and what it is being read from. */
+        hdr.h = 34;
+        hdr.y -= 10;
+        snprintf(line, sizeof line, "Controller %d", g_bind_port + 1);
+        theme_text(hdr, line, 13, 700, THEME_TEXT, THEME_LEFT);
+        {
+            ThemeRect d = hdr;
+
+            d.x += 170; d.w -= 170;
+            if (bp->device == BIND_DEV_XINPUT)
+                snprintf(line, sizeof line, "Gamepad %d%s", bp->pad + 1,
+                         XInputGetState((DWORD)bp->pad, &(XINPUT_STATE){0}) ==
+                             ERROR_SUCCESS ? "  (connected)" : "  (not plugged in)");
+            else if (bp->device == BIND_DEV_KEYBOARD)
+                snprintf(line, sizeof line, "Keyboard");
+            else
+                snprintf(line, sizeof line, "Nothing");
+            theme_text(d, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+        }
+
+        /* Column headings, so the two sides are not a guess. */
+        {
+            ThemeRect h2 = hdr;
+
+            h2.y += 26; h2.h = 20;
+            h2.x += 300; h2.w = 200;
+            theme_text(h2, "CONTROLLER", 10, 700,
+                       g_bind_col == 0 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            h2.x += 210;
+            theme_text(h2, "KEYBOARD", 10, 700,
+                       g_bind_col == 1 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+        }
+
+        for (i = 0; i < BIND_ROWS_VISIBLE; i++) {
+            int k = g_bind_top + i;
+            ThemeRect rr, lr, cv;
+            double lit;
+
+            if (k >= BIND_CONTROLS)
+                break;
+            rr = row_rect(i);
+            rr.y += 34;
+            rr.h = 46;
+            lit = (i == g_sel) ? 1.0 : 0.0;
+            theme_panel(rr, lit);
+
+            lr = rr; lr.x += 22; lr.w = 270;
+            theme_text(lr, bind_control_labels[k], 12, 600,
+                       lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+
+            cv = rr; cv.x += 300; cv.w = 200;
+            theme_text(cv,
+                       (g_capturing && lit > 0.5 && g_bind_col == 0)
+                           ? "press something..." : bind_source_label(bp->pad_src[k]),
+                       12, 400,
+                       (lit > 0.5 && g_bind_col == 0) ? THEME_GREEN : THEME_TEXT_DIM,
+                       THEME_LEFT);
+
+            cv.x += 210;
+            theme_text(cv,
+                       (g_capturing && lit > 0.5 && g_bind_col == 1)
+                           ? "press a key..." : bind_source_label(bp->key_src[k]),
+                       12, 400,
+                       (lit > 0.5 && g_bind_col == 1) ? THEME_GREEN : THEME_TEXT_DIM,
+                       THEME_LEFT);
+        }
+
+        /* Where we are in a list longer than the screen. */
+        {
+            ThemeRect sb;
+
+            sb.x = g_cw - 48;
+            sb.w = 4;
+            sb.h = (BIND_ROWS_VISIBLE * 62) * BIND_ROWS_VISIBLE / BIND_CONTROLS;
+            sb.y = row_rect(0).y + 34 +
+                   (BIND_ROWS_VISIBLE * 62 - sb.h) * g_bind_top /
+                   (BIND_CONTROLS - BIND_ROWS_VISIBLE);
+            theme_panel(sb, 0.5);
+        }
+
+        r.x = 62; r.y = row_rect(0).y + 34 + BIND_ROWS_VISIBLE * 62 + 2;
+        r.w = g_cw - 124; r.h = 40;
+        theme_text_wrapped(r, g_capturing
+            ? "Press what you want this to be. Escape cancels."
+            : "Left and right choose the controller or the keyboard column. "
+              "A or Enter rebinds. Bindings are shared by every game.",
             11, THEME_TEXT_DIM);
     } else {
         ThemeRect p = row_rect(0);
@@ -611,6 +894,26 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             if (mx >= t.x && mx < t.x + t.w && my >= t.y && my < t.y + t.h)
                 set_tab((Tab)i);
         }
+        if (g_tab == TAB_INPUT) {
+            int j;
+
+            for (j = 0; j < BIND_ROWS_VISIBLE; j++) {
+                ThemeRect rr = row_rect(j);
+
+                rr.y += 34; rr.h = 46;
+                if (my >= rr.y && my < rr.y + rr.h && mx >= rr.x &&
+                    mx < rr.x + rr.w && g_bind_top + j < BIND_CONTROLS) {
+                    g_sel = j;
+                    g_bind_col = (mx >= rr.x + 510) ? 1 : 0;
+                    g_capturing = 1;
+                    g_capture_armed = 0;
+                }
+            }
+            if (hit_play(mx, my))
+                do_play();
+            InvalidateRect(h, NULL, FALSE);
+            return 0;
+        }
         i = hit_row(mx, my);
         if (i >= 0) {
             ThemeRect r = row_rect(i);
@@ -648,7 +951,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             if (g_tab_t > 1.0) g_tab_t = 1.0;
         }
         g_pad_seen = pad_poll(&dx, &dy, &a, &b, &t);
-        if (g_pad_seen && (dx || dy || a || b || t))
+        if (g_capturing)
+            capture_tick();             /* the press is the answer, not a move */
+        else if (g_pad_seen && (dx || dy || a || b || t))
             nav(dx, dy, a, b, t);
         rows_for_tab();
         InvalidateRect(h, NULL, FALSE);
@@ -685,6 +990,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     read_title();
     settings_load();
+    bindings_load();
     build_rows();
     rows_for_tab();
 

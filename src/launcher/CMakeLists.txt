@@ -17,6 +17,7 @@ if(WIN32)
         add_executable(${TARGET} WIN32
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/launcher.c
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/launcher_theme.c
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/launcher_bindings.c
         )
         target_include_directories(${TARGET} PRIVATE
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
