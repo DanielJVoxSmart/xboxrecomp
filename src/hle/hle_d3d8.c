@@ -64,6 +64,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "hle.h"
+#include "recomp_config.h"
 
 #ifdef _WIN32
 #include "d3d8_xbox.h"
@@ -1315,7 +1316,7 @@ static void overlay_frame(void)
     int front, f9, f10, f11;
 
     if (!configured) {
-        const char *v = getenv("RECOMP_FPS_OVERLAY");
+        const char *v = recomp_config_lookup("RECOMP_FPS_OVERLAY", "fps_overlay");
 
         configured = 1;
         enabled = v && *v && strcmp(v, "0") != 0;
