@@ -130,6 +130,11 @@ static int ps_dump_limit(void)
     return n > 0 ? n : 2;
 }
 
+uint32_t d3d8_combiners_current_hash(void)
+{
+    return (uint32_t)combiner_state_hash(&g_combiner_state);
+}
+
 /* The shader for g_combiner_state as last parsed. The lookup hashes ~1.5 KB
  * per call and was the largest host-side symbol in TimeSplitters 2's
  * profile; the state only changes when a PS render state does, so the
@@ -922,6 +927,19 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                     EMIT("    result.a = 1.0;\n");
                     break;
                 }
+        }
+        if (show && strcmp(show, "t0lod") == 0 &&
+            state->tex_mode[0] != NV2A_TEXMODE_NONE &&
+            state->tex_mode[0] != NV2A_TEXMODE_CUBEMAP &&
+            state->tex_mode[0] != NV2A_TEXMODE_3D) {
+            /* Why a sample came back zero: the ordinary sample, the same
+             * same texel fetched without a sampler, and the coordinate itself,
+             * as R, G and B. A sampler that has been pointed past the only
+             * mip a texture has and a coordinate that is not where the
+             * draw thinks it is both end in black otherwise. */
+            EMIT("    result = float4(r_t0.r, "
+                 "tex0.Load(int3(input.pos.xy, 0)).r, "
+                 "frac(input.tc0.x), 1.0);\n");
         }
         if (show && strcmp(show, "foga") == 0) {     /* the fog factor */
             EMIT("    result.rgb = r_fog.aaa;\n");

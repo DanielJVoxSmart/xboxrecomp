@@ -387,6 +387,12 @@ DWORD d3d8_combiners_get_pixel_shader(void);
  */
 BOOL d3d8_combiners_active(void);
 
+/* The hash of the combiner state the next draw will use -- the same number
+ * RECOMP_D3D8_PS_DUMP prints beside each generated shader. Diagnostics use
+ * it to name the shader behind a particular draw without relying on the
+ * order two logs happen to interleave in. */
+uint32_t d3d8_combiners_current_hash(void);
+
 #ifdef __cplusplus
 }
 #endif

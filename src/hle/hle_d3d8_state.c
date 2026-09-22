@@ -500,6 +500,31 @@ static int plausible_va(uint32_t va)
     return va >= 0x10000u && va < 0x08000000u && (va & 3u) == 0u;
 }
 
+/* The title's own value for one of its render states, for diagnostics
+ * that need to know what it actually asked for rather than what the
+ * generated shader implies. */
+uint32_t hle_d3d8_guest_render_state(uint32_t xbox_state)
+{
+    return guest_rs(xbox_state);
+}
+
+/* The title's own value for one of its texture stage states, and the pixel
+ * shader object it has selected. Same purpose as the render state reader
+ * above: diagnostics that need the title's request, not our rendering of
+ * it. */
+uint32_t hle_d3d8_guest_texture_state(uint32_t stage, uint32_t xbox_slot)
+{
+    if (!state_ready() || stage >= STAGES || xbox_slot >= STAGE_SIZE)
+        return 0;
+    return HLE_MEM32(hle_var_D3D_g_DeferredTextureState +
+                     (stage * STAGE_SIZE + xbox_slot) * 4u);
+}
+
+uint32_t hle_d3d8_guest_pixel_shader(void)
+{
+    return g_ps_handle;
+}
+
 void hle_d3d8_pixel_shader_selected(uint32_t handle)
 {
     uint32_t def = 0;
