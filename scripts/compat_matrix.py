@@ -33,6 +33,7 @@ These are windowed programs: a run opens a window per title, in sequence.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -75,6 +76,7 @@ def discover(only=None):
             "game": game,
             "exe": main_c.parent.parent / "build" / "Release" / f"{name}_recomp.exe",
             "pipeline": ROOT / "games" / "_pipeline" / name / "out",
+            "game_dir": (ROOT / "games" / game) if game else None,
         })
     return out
 
@@ -306,6 +308,77 @@ def frame_lit(shots_dir, name):
     return (max(seen) if seen else None), len(seen)
 
 
+# Titles whose front end wants something other than the default. Keyed by
+# project name; the value is a RECOMP_INPUT_SEQ string used verbatim.
+TITLE_INPUT = {}
+
+
+@contextlib.contextmanager
+def fresh_save_data(game_dir, enabled=True):
+    """Run with no save profile present, then put the player's back.
+
+    A driven run presses A through the front end, and a title that already has
+    a save meets that with "overwrite?" -- so the script is answering a
+    question nobody meant to ask, on a screen the measurement was not aiming
+    at, and the run measures the save dialog instead of the game.
+
+    Nothing is deleted, ever. The existing UDATA is renamed aside, the title
+    makes its own during the run, that one is moved into a scratch directory
+    afterwards, and the original is renamed back. A crash mid-run leaves the
+    original under its aside name rather than losing it, and the restore
+    refuses to clobber anything it did not move itself.
+    """
+    if not enabled or not game_dir or not game_dir.is_dir():
+        yield
+        return
+    live = game_dir / "UDATA"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    aside = game_dir / f"UDATA.matrix-aside-{stamp}"
+    moved = False
+    try:
+        if live.is_dir():
+            if aside.exists():
+                # Someone else's aside, or a previous crash. Leave it alone
+                # and leave the save alone with it.
+                yield
+                return
+            live.rename(aside)
+            moved = True
+        yield
+    finally:
+        if moved:
+            scratch = ROOT / "games" / "_pipeline" / "_matrix" / "udata-scratch"
+            if live.is_dir():
+                scratch.mkdir(parents=True, exist_ok=True)
+                dest = scratch / f"{game_dir.name}-{stamp}"
+                if not dest.exists():
+                    live.rename(dest)
+            if not live.exists():
+                aside.rename(live)
+
+
+def default_input_seq(seconds):
+    """Press start a few times, then A, spread across the measured window.
+
+    A title left alone is not a title being played, and the difference is not
+    cosmetic: TimeSplitters 2 faults on 10 runs out of 10 when it is left on
+    its start screen for 75 seconds and 0 out of 10 when something walks it
+    through the menus. Every measurement this harness had ever taken was the
+    idle path, so it spent two days reporting an attract-mode crash as a
+    property of the title, and a bisect across three commits found nothing
+    because all three were measuring the same thing.
+
+    Proportions rather than fixed times, so the path scales with --seconds:
+    start while the title is still booting, then A often enough to walk a menu
+    without running off the end of the window.
+    """
+    ms = seconds * 1000
+    steps = ["%d:start" % int(ms * f) for f in (0.17, 0.23, 0.29, 0.35)]
+    steps += ["%d:a" % int(ms * f)
+              for f in (0.42, 0.50, 0.58, 0.66, 0.74, 0.82, 0.90, 0.96)]
+    return ",".join(steps)
+
+
 def run_title(t, seconds, out_dir, extra_env=None):
     if not t["exe"].is_file():
         return {"verdict": "not built", "exit": None, "boot": False,
@@ -327,6 +400,8 @@ def run_title(t, seconds, out_dir, extra_env=None):
     shots.mkdir(exist_ok=True)
     for old in shots.glob(f"{t['name']}*.bmp"):
         old.unlink()
+    if t.get("input_seq"):
+        env.setdefault("RECOMP_INPUT_SEQ", t["input_seq"])
     env.setdefault("RECOMP_HLE_D3D8_DUMP", str(shots / t["name"]))
     # Every 20 swaps, not 150: six of eleven titles came back with no frame
     # captured at all, so "renders" went unverified on half the table while
@@ -336,7 +411,8 @@ def run_title(t, seconds, out_dir, extra_env=None):
     env.setdefault("RECOMP_HLE_D3D8_DUMP_EVERY", "20")
     env.update(extra_env or {})
     err_path = out_dir / f"{t['name']}.err"
-    with open(err_path, "wb") as errf:
+    with open(err_path, "wb") as errf, fresh_save_data(t.get("game_dir"),
+                                                       t.get("fresh_saves")):
         p = subprocess.Popen([str(t["exe"])], cwd=str(t["project"]),
                              stdout=subprocess.DEVNULL, stderr=errf, env=env)
         try:
@@ -418,7 +494,9 @@ COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher")
 #   2  lit column, from the last capture, dumped every 150 swaps
 #   3  lit from the best capture every 20 swaps, shot count, crash verdicts
 #   4  motion: whether the picture changes between captures at all
-METHOD = 4
+#   5  titles are driven through their front end instead of left idle,
+#      each starting with no save profile present
+METHOD = 5
 
 
 # How far a title got, worst to best. A verdict change is only a regression
@@ -560,6 +638,17 @@ def print_table(rows, baseline=None, baseline_method=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--keep-saves", action="store_true",
+                    help="leave each title's UDATA in place. By default it is "
+                         "moved aside for the run and put back afterwards, so "
+                         "a driven run meets a first-time front end instead of "
+                         "an overwrite prompt. Nothing is ever deleted")
+    ap.add_argument("--idle", action="store_true",
+                    help="do not press anything. The old behaviour, and worth "
+                         "having: TimeSplitters 2 crashes 10/10 idle and 0/10 "
+                         "driven, so the two paths are different measurements "
+                         "and an attract-mode fault is only visible in this "
+                         "one")
     ap.add_argument("--repeat", type=int, default=1, metavar="N",
                     help="run each title N times and report the worst, with "
                          "how many runs agreed. Anything below 5 cannot see a "
@@ -619,6 +708,10 @@ def main():
         if args.no_run:
             continue
         t0 = time.time()
+        if not args.idle:
+            t["input_seq"] = TITLE_INPUT.get(t["name"],
+                                             default_input_seq(args.seconds))
+        t["fresh_saves"] = not args.keep_saves
         rows[t["name"]] = run_repeated(t, args.seconds, out_dir, args.repeat)
         print(f"{prefix} {rows[t['name']]['verdict']} "
               f"({time.time() - t0:.0f}s)", flush=True)
@@ -632,7 +725,8 @@ def main():
     stamp = time.strftime("%Y%m%d-%H%M%S")
     jpath = out_dir / f"matrix-{stamp}.json"
     jpath.write_text(json.dumps({"seconds": args.seconds, "repeat": args.repeat,
-                                 "method": METHOD, "titles": rows},
+                                 "idle": args.idle, "method": METHOD,
+                                 "titles": rows},
                                 indent=1), encoding="utf-8")
     latest = out_dir / "matrix-latest.json"
     latest.write_text(jpath.read_text(encoding="utf-8"), encoding="utf-8")
