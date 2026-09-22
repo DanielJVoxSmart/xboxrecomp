@@ -347,8 +347,82 @@ static void resync_output(Buffer *b, int continuing)
 }
 
 /* HRESULT IDirectSoundBuffer_Play(this, reserved1, reserved2, flags) */
+/* How often the title calls each of these.
+ *
+ * DirectSoundDoWork alone turned out to be 68.8 million calls in 85 seconds
+ * of Dino Crisis 3 -- some 62,000 per presented frame against a console
+ * budget of one -- and a count on its own does not say what the title is
+ * waiting for. The ratio does: a poll loop shows up as one other entry point
+ * keeping pace with DoWork, and everything else near zero.
+ *
+ * Reported on powers of ten of the DoWork count, so this costs a handful of
+ * lines across a whole run. */
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
+
+enum {
+    DS_CALL_BUF_PLAY,
+    DS_CALL_BUF_STOP,
+    DS_CALL_BUF_STOPEX,
+    DS_CALL_BUF_GETSTATUS,
+    DS_CALL_BUF_GETCURRENTPOSITION,
+    DS_CALL_BUF_SETCURRENTPOSITION,
+    DS_CALL_BUF_SETFREQUENCY,
+    DS_CALL_DIRECTSOUNDDOWORK,
+    DS_CALL_COUNT
+};
+static uint64_t g_ds_calls[DS_CALL_COUNT];
+static const char *const g_ds_call_names[DS_CALL_COUNT] = {
+    "IDirectSoundBuffer_Play",
+    "IDirectSoundBuffer_Stop",
+    "IDirectSoundBuffer_StopEx",
+    "IDirectSoundBuffer_GetStatus",
+    "IDirectSoundBuffer_GetCurrentPosition",
+    "IDirectSoundBuffer_SetCurrentPosition",
+    "IDirectSoundBuffer_SetFrequency",
+    "DirectSoundDoWork",
+};
+
+/* `caller` is the guest return address, which is the thing that actually
+ * identifies the loop. DirectSoundDoWork at 810,000 calls a second is not
+ * paired with any other entry point here -- GetCurrentPosition, the next
+ * busiest, runs at an eighth of it -- so the counts alone say only that
+ * something outside this file is calling it, and not what. */
+static void ds_count_report(uint32_t caller)
+{
+    int i;
+    fprintf(stderr, "[DSOUND] calls so far (DoWork from 0x%08X):", caller);
+    for (i = 0; i < DS_CALL_COUNT; i++)
+        if (g_ds_calls[i])
+            fprintf(stderr, " %s=%llu", g_ds_call_names[i],
+                    (unsigned long long)g_ds_calls[i]);
+    fprintf(stderr, "\n");
+    /* And the chain above it. The immediate caller is a game tick that
+     * happens to include this call; what matters is the loop spinning on
+     * that tick 58,000 times per presented frame. Same heuristic the ICALL
+     * logger uses: code-range values above esp, first one most reliable. */
+    {
+        const uint8_t *stk = (const uint8_t *)g_xbox_mem_offset + g_esp;
+        int k, shown = 0;
+        fprintf(stderr, "[DSOUND]   guest stack:");
+        for (k = 0; g_esp && k < 200 && shown < 8; k++) {
+            uint32_t v;
+            memcpy(&v, stk + (size_t)k * 4, sizeof v);
+            if (v >= g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "%s 0x%08X", shown ? " <-" : "", v);
+                shown++;
+            }
+        }
+        if (!shown)
+            fprintf(stderr, " (none)");
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
+
 HLE_EXPORT(IDirectSoundBuffer_Play)
 {
+    g_ds_calls[DS_CALL_BUF_PLAY]++;
     uint32_t iface = HLE_ARG(0), flags = HLE_ARG(3), result;
     uint64_t now = now_ms();
     static unsigned said;
@@ -441,6 +515,7 @@ static void stop(uint32_t iface)
 /* HRESULT IDirectSoundBuffer_Stop(this) */
 HLE_EXPORT(IDirectSoundBuffer_Stop)
 {
+    g_ds_calls[DS_CALL_BUF_STOP]++;
     stop(HLE_ARG(0));
     HLE_RETURN(HLE_ARG(0) ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
 }
@@ -450,6 +525,7 @@ HLE_EXPORT(IDirectSoundBuffer_Stop)
  * immediate one is what the game can observe, and all it waits for. */
 HLE_EXPORT(IDirectSoundBuffer_StopEx)
 {
+    g_ds_calls[DS_CALL_BUF_STOPEX]++;
     stop(HLE_ARG(0));
     HLE_RETURN(HLE_ARG(0) ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
 }
@@ -457,6 +533,7 @@ HLE_EXPORT(IDirectSoundBuffer_StopEx)
 /* HRESULT IDirectSoundBuffer_GetStatus(this, DWORD *status) */
 HLE_EXPORT(IDirectSoundBuffer_GetStatus)
 {
+    g_ds_calls[DS_CALL_BUF_GETSTATUS]++;
     uint32_t iface = HLE_ARG(0), out = HLE_ARG(1), status = 0u;
     uint64_t now = now_ms();
     Buffer *b;
@@ -479,6 +556,7 @@ HLE_EXPORT(IDirectSoundBuffer_GetStatus)
 /* HRESULT IDirectSoundBuffer_GetCurrentPosition(this, DWORD *play, DWORD *write) */
 HLE_EXPORT(IDirectSoundBuffer_GetCurrentPosition)
 {
+    g_ds_calls[DS_CALL_BUF_GETCURRENTPOSITION]++;
     uint32_t iface = HLE_ARG(0), cursor = 0u, i;
     uint64_t now = now_ms();
     Buffer *b;
@@ -505,6 +583,7 @@ HLE_EXPORT(IDirectSoundBuffer_GetCurrentPosition)
 /* HRESULT IDirectSoundBuffer_SetCurrentPosition(this, DWORD position) */
 HLE_EXPORT(IDirectSoundBuffer_SetCurrentPosition)
 {
+    g_ds_calls[DS_CALL_BUF_SETCURRENTPOSITION]++;
     uint32_t iface = HLE_ARG(0), position = HLE_ARG(1), result = RECOMP_DSOUND_OK;
     uint64_t now = now_ms();
     Buffer *b;
@@ -533,6 +612,7 @@ HLE_EXPORT(IDirectSoundBuffer_SetCurrentPosition)
 /* HRESULT IDirectSoundBuffer_SetFrequency(this, DWORD frequency); 0 = default */
 HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
 {
+    g_ds_calls[DS_CALL_BUF_SETFREQUENCY]++;
     uint32_t iface = HLE_ARG(0), frequency = HLE_ARG(1), result = RECOMP_DSOUND_OK;
     uint64_t now = now_ms();
     Buffer *b;
@@ -554,6 +634,7 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
  * replaced buffers no longer need; here it feeds the host output. */
 HLE_EXPORT(DirectSoundDoWork)
 {
+    g_ds_calls[DS_CALL_DIRECTSOUNDDOWORK]++;
     uint64_t now = now_ms();
     uint32_t i;
     static int said;
@@ -579,9 +660,7 @@ HLE_EXPORT(DirectSoundDoWork)
         static uint64_t calls, next = 1;
         if (++calls >= next) {
             next *= 10;
-            fprintf(stderr, "[DSOUND] DirectSoundDoWork called %llu time(s)\n",
-                    (unsigned long long)calls);
-            fflush(stderr);
+            ds_count_report(HLE_MEM32(g_esp));
         }
     }
     lock();
