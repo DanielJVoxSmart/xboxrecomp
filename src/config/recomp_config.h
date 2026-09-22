@@ -29,6 +29,7 @@
 #ifndef XBOXRECOMP_RECOMP_CONFIG_H
 #define XBOXRECOMP_RECOMP_CONFIG_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* The running title, from its XBE certificate, which decides the file's
@@ -53,5 +54,41 @@ double recomp_config_float(const char *env_name, const char *key, double fallbac
 /* The file the lookups read, for a log line or a launcher; NULL when no
  * file was found. */
 const char *recomp_config_path(void);
+
+/* ------------------------------------------------------------ settings */
+
+/* The settings a player chooses, as one thing, so the launcher that
+ * writes the file and the runtime that reads it cannot drift apart on
+ * what the file contains. The runtime still reads values one at a time
+ * through the lookups above -- that keeps the environment override
+ * visible where each setting is used -- but the file's shape is here. */
+typedef struct RecompSettings {
+    int  resolution_scale;      /* 1..8 */
+    int  widescreen;            /* 0 or 1 */
+    double hor_plus;            /* 0 leaves the camera alone; 0.75 is 4:3->16:9 */
+    int  hor_plus_register;     /* per title; 60 for TimeSplitters 2 */
+    int  anisotropy;            /* 1..16 */
+    char frame_cap[16];         /* "adaptive", "60", "30", "0" */
+    int  fps_overlay;           /* 0 or 1 */
+    char game_dir[512];         /* empty means beside the executable */
+} RecompSettings;
+
+void recomp_settings_defaults(RecompSettings *s);
+
+/* Read the file at `path` into `s`, starting from the defaults. Absent
+ * keys keep their default, so an older file gains new settings rather
+ * than losing them. Returns 0 if the file could not be read at all. */
+int  recomp_settings_read(const char *path, RecompSettings *s);
+
+/* Write `s` to `path`, comments and all, creating the directories above
+ * it. Returns 0 on failure. This is the only place the file's text is
+ * written, by the launcher and by the runtime's first-run default
+ * alike. */
+int  recomp_settings_write(const char *path, const RecompSettings *s);
+
+/* Where this title's file belongs: RECOMP_DISPLAY_CONFIG if set,
+ * otherwise the per-user path for `title_id`. Returns 0 if there is
+ * nowhere sensible to put it. */
+int  recomp_settings_path(uint32_t title_id, char *out, size_t n);
 
 #endif /* XBOXRECOMP_RECOMP_CONFIG_H */

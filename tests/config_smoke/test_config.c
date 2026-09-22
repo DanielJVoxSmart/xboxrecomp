@@ -120,6 +120,57 @@ int main(void)
     check_str(recomp_config_lookup("RECOMP_TEST_UNSET", "resolution_scale"), "2",
               "unset variable falls through to the file");
 
+    /* The round trip is the contract between the launcher, which writes
+     * the file, and the runtime, which reads it. Write settings out, read
+     * them back, and they must be the same settings. */
+    {
+        const char *rt = "test_config_roundtrip.conf";
+        RecompSettings out, back;
+
+        recomp_settings_defaults(&out);
+        out.resolution_scale  = 3;
+        out.widescreen        = 1;
+        out.hor_plus          = 0.75;
+        out.hor_plus_register = 60;
+        out.anisotropy        = 16;
+        out.fps_overlay       = 1;
+        snprintf(out.frame_cap, sizeof out.frame_cap, "60");
+        snprintf(out.game_dir, sizeof out.game_dir, "D:\\games\\ts2");
+
+        check(recomp_settings_write(rt, &out) != 0, "settings written");
+        check(recomp_settings_read(rt, &back) != 0, "settings read back");
+        check_int(back.resolution_scale, 3, "round trip: scale");
+        check_int(back.widescreen, 1, "round trip: widescreen");
+        check(back.hor_plus > 0.74 && back.hor_plus < 0.76, "round trip: hor_plus");
+        check_int(back.hor_plus_register, 60, "round trip: register");
+        check_int(back.anisotropy, 16, "round trip: anisotropy");
+        check_int(back.fps_overlay, 1, "round trip: overlay");
+        check_str(back.frame_cap, "60", "round trip: frame cap");
+        check_str(back.game_dir, "D:\\games\\ts2", "round trip: game dir");
+
+        /* A file written by an older build, missing newer keys, must keep
+         * the defaults for them rather than zeroing them. */
+        write_file(rt, "resolution_scale = 4\n");
+        check(recomp_settings_read(rt, &back) != 0, "partial file read");
+        check_int(back.resolution_scale, 4, "partial: the key that is there");
+        check_int(back.anisotropy, 1, "partial: absent key keeps its default");
+        check_str(back.frame_cap, "adaptive", "partial: absent word keeps default");
+
+        /* Out-of-range values are clamped, not taken literally: a hand
+         * edited 99 must not ask for a 99x render. */
+        write_file(rt, "resolution_scale = 99\nanisotropy = 0\n");
+        check(recomp_settings_read(rt, &back) != 0, "clamped file read");
+        check_int(back.resolution_scale, 8, "clamp: scale to 8");
+        check_int(back.anisotropy, 1, "clamp: anisotropy to 1");
+
+        remove(rt);
+    }
+
+    /* Reading settings must not disturb the lookup table the runtime is
+     * already using -- the launcher does both in one process. */
+    check_str(recomp_config_lookup(NULL, "resolution_scale"), "2",
+              "lookups survive a settings read");
+
     remove(path);
     if (failures)
         printf("test_config: %d FAILURE(S)\n", failures);

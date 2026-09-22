@@ -44,6 +44,10 @@ void recomp_config_set_title(uint32_t title_id)
     g_title_id = title_id;
 }
 
+/* Defined below, beside the lookups it belongs to; needed by the
+ * settings reader above it. */
+static const char *from_table(const char *key);
+
 /* ----------------------------------------------------------------- text */
 
 /* Case-insensitive compare, spelled out rather than borrowed: stricmp is
@@ -164,31 +168,115 @@ static int readable(const char *path)
     return 1;
 }
 
-/* A file that says what it is, written once if nothing is there. A player
- * who never opens the launcher still gets something they can read and
- * edit, and it documents the names the launcher writes. Best effort: a
- * read-only or missing directory is not an error, it just means there is
- * no file and the defaults stand. */
-static void write_default(const char *dir, const char *path)
+/* ------------------------------------------------------------ settings */
+
+void recomp_settings_defaults(RecompSettings *s)
 {
-    char sub[1024];
+    if (!s)
+        return;
+    memset(s, 0, sizeof *s);
+    s->resolution_scale  = 1;
+    s->widescreen        = 0;
+    s->hor_plus          = 0.0;
+    s->hor_plus_register = 60;
+    s->anisotropy        = 1;
+    s->fps_overlay       = 0;
+    snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
+}
+
+static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+int recomp_settings_read(const char *path, RecompSettings *s)
+{
+    Entry saved[MAX_ENTRIES];
+    int saved_count = g_entry_count, saved_loaded = g_loaded;
     FILE *f;
-#if defined(_WIN32)
-    const char sep = '\\';
-#else
-    const char sep = '/';
-#endif
 
-    RECOMP_MKDIR(dir);
-    snprintf(sub, sizeof sub, "%s%ctitles", dir, sep);
-    RECOMP_MKDIR(sub);
+    if (!path || !s)
+        return 0;
+    recomp_settings_defaults(s);
 
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+
+    /* The table is the lookup path's; borrow it, then put it back, so a
+     * launcher reading a file does not disturb a runtime that has
+     * already loaded its own. */
+    memcpy(saved, g_entries, sizeof saved);
+    g_entry_count = 0;
+    parse(f);
+    fclose(f);
+
+    {
+        const char *v;
+
+        if ((v = from_table("resolution_scale")) != NULL)
+            s->resolution_scale = clamp_int(atoi(v), 1, 8);
+        if ((v = from_table("widescreen")) != NULL)
+            s->widescreen = !off_word(v);
+        if ((v = from_table("hor_plus")) != NULL)
+            s->hor_plus = atof(v);
+        if ((v = from_table("hor_plus_register")) != NULL)
+            s->hor_plus_register = clamp_int(atoi(v), 0, 191);
+        if ((v = from_table("anisotropy")) != NULL)
+            s->anisotropy = clamp_int(atoi(v), 1, 16);
+        if ((v = from_table("frame_cap")) != NULL)
+            snprintf(s->frame_cap, sizeof s->frame_cap, "%s", v);
+        if ((v = from_table("fps_overlay")) != NULL)
+            s->fps_overlay = !off_word(v);
+        if ((v = from_table("game_dir")) != NULL)
+            snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
+    }
+
+    memcpy(g_entries, saved, sizeof saved);
+    g_entry_count = saved_count;
+    g_loaded = saved_loaded;
+    return 1;
+}
+
+/* Everything above the file's directory, made if it is not there. */
+static void make_parents(const char *path)
+{
+    char buf[1024];
+    size_t i;
+
+    snprintf(buf, sizeof buf, "%s", path);
+    for (i = 0; buf[i]; i++) {
+        if (buf[i] == '\\' || buf[i] == '/') {
+            char c = buf[i];
+
+            buf[i] = '\0';
+            if (i > 0)
+                RECOMP_MKDIR(buf);
+            buf[i] = c;
+        }
+    }
+}
+
+/* The one place the file's text is written: the runtime's first-run
+ * default and the launcher's save are the same function, so the comments
+ * a player reads cannot drift from the keys the runtime looks for. */
+int recomp_settings_write(const char *path, const RecompSettings *s)
+{
+    RecompSettings d;
+    FILE *f;
+
+    if (!path)
+        return 0;
+    if (!s) {
+        recomp_settings_defaults(&d);
+        s = &d;
+    }
+
+    make_parents(path);
     f = fopen(path, "wb");
     if (!f)
-        return;
+        return 0;
+
     fprintf(f,
         "# Settings for this title, written by the launcher and read when the\n"
-        "# game starts. Every line here can be overridden by the environment\n"
+        "# game starts. Every line can be overridden by the environment\n"
         "# variable named beside it, so a .bat or a command line still wins.\n"
         "#\n"
         "# Delete this file to go back to the defaults.\n"
@@ -196,37 +284,68 @@ static void write_default(const char *dir, const char *path)
         "# How much larger than the console the game is rendered, before being\n"
         "# filtered back down: supersampling. 1 is the console's own size. 2 is\n"
         "# a good default and costs little. Up to 8.        [RECOMP_RES_SCALE]\n"
-        "resolution_scale = 1\n"
+        "resolution_scale = %d\n"
         "\n"
         "# Present at 16:9 rather than 4:3, and tell the game the console is\n"
         "# widescreen. Only right for a game with a widescreen mode of its own;\n"
         "# one without draws 4:3 and will look stretched.  [RECOMP_WIDESCREEN]\n"
-        "widescreen = 0\n"
+        "widescreen = %d\n"
         "\n"
         "# Widen the camera's horizontal field of view to match, so you see\n"
         "# more to the sides instead of the same view stretched. 0.75 is the\n"
         "# 4:3-to-16:9 figure; 0 leaves the camera alone.     [RECOMP_HOR_PLUS]\n"
-        "hor_plus = 0\n"
+        "hor_plus = %g\n"
         "\n"
         "# Which vertex constant register holds the projection, for the line\n"
         "# above. Per game; 60 for TimeSplitters 2.       [RECOMP_HOR_PLUS_REG]\n"
-        "hor_plus_register = 60\n"
+        "hor_plus_register = %d\n"
         "\n"
         "# Sharpen textures seen at a glancing angle, 1 to 16. The flat layer\n"
-        "# is left alone, which wants no filtering.               [RECOMP_ANISO]\n"
-        "anisotropy = 1\n"
+        "# is left alone, which wants no filtering.              [RECOMP_ANISO]\n"
+        "anisotropy = %d\n"
         "\n"
         "# Frame pacing: adaptive, 60, 30, or 0 for uncapped.  [RECOMP_FPS_CAP]\n"
-        "frame_cap = adaptive\n"
+        "frame_cap = %s\n"
         "\n"
         "# Show the frame rate from the moment the game starts. F9 toggles it\n"
         "# while playing either way.                      [RECOMP_FPS_OVERLAY]\n"
-        "fps_overlay = 0\n"
+        "fps_overlay = %d\n"
         "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
-        "#                                                   [RECOMP_GAME_DIR]\n"
-        "# game_dir =\n");
+        "#                                                   [RECOMP_GAME_DIR]\n",
+        s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
+        s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay);
+
+    if (s->game_dir[0])
+        fprintf(f, "game_dir = %s\n", s->game_dir);
+    else
+        fprintf(f, "# game_dir =\n");
+
     fclose(f);
+    return 1;
+}
+
+int recomp_settings_path(uint32_t title_id, char *out, size_t n)
+{
+    const char *env = getenv("RECOMP_DISPLAY_CONFIG");
+    char dir[1024];
+
+    if (!out || !n)
+        return 0;
+    if (env && *env) {
+        snprintf(out, n, "%s", env);
+        return 1;
+    }
+    if (!user_dir(dir, sizeof dir))
+        return 0;
+    {
+        uint32_t saved = g_title_id;
+
+        g_title_id = title_id;
+        title_file(out, n, dir);
+        g_title_id = saved;
+    }
+    return 1;
 }
 
 static void load(void)
@@ -256,7 +375,7 @@ static void load(void)
     if (user_dir(dir, sizeof dir)) {
         title_file(path, sizeof path, dir);
         if (!readable(path))
-            write_default(dir, path);
+            recomp_settings_write(path, NULL);
         f = fopen(path, "rb");
         if (f) {
             parse(f);
@@ -280,18 +399,26 @@ static void load(void)
 
 /* ---------------------------------------------------------------- lookup */
 
-static const char *from_file(const char *key)
+/* The table as it stands, without loading anything. */
+static const char *from_table(const char *key)
 {
     int i;
 
     if (!key)
         return NULL;
-    if (!g_loaded)
-        load();
     for (i = 0; i < g_entry_count; i++)
         if (strcmp(g_entries[i].key, key) == 0)
             return g_entries[i].value[0] ? g_entries[i].value : NULL;
     return NULL;
+}
+
+static const char *from_file(const char *key)
+{
+    if (!key)
+        return NULL;
+    if (!g_loaded)
+        load();
+    return from_table(key);
 }
 
 const char *recomp_config_lookup(const char *env_name, const char *key)
