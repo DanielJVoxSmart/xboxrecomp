@@ -53,6 +53,10 @@ add_subdirectory(src/platform)
 # comes before all three and depends on none of them.
 add_subdirectory(src/config)
 
+# The launcher a title ships beside its game. Defines recomp_add_launcher
+# for a title's CMakeLists to call; builds nothing on its own.
+add_subdirectory(src/launcher)
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
