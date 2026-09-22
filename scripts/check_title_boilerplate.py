@@ -53,6 +53,14 @@ SHARED = [
 REGION_BEGIN = "/* ── Register state (defined in xbox_memory_layout.c) ──────── */"
 REGION_END = "/* ── Manual function overrides ─────────────────────────────── */"
 
+# The includes and the macros above them, by the same method. This was missed
+# the first time and the omission bit immediately: adding RECOMP_DIAG_LOCK to
+# the template gave every title a function that used a macro none of them
+# defined. A region that holds what the shared functions depend on has to be
+# synced with them or the sync does not build.
+PREAMBLE_BEGIN = "#include <stdio.h>"
+PREAMBLE_END = "/* ── ICALL trace ring buffer ───────────────────────────────── */"
+
 
 def read(path):
     text = io.open(path, encoding="utf-8", newline="").read()
@@ -84,13 +92,13 @@ def extract(path, name):
     return lines, start, end + 1
 
 
-def extract_region(path):
-    """(lines, start, end) for the extern block between the two markers."""
+def extract_region(path, begin=REGION_BEGIN, end=REGION_END):
+    """(lines, start, end) for the block between two marker lines."""
     text, _nl = read(path)
     lines = text.split(_nl)
     try:
-        s = lines.index(REGION_BEGIN)
-        e = lines.index(REGION_END)
+        s = lines.index(begin)
+        e = lines.index(end)
     except ValueError:
         return None
     return lines, s, e
@@ -113,35 +121,43 @@ def main(argv=None):
         lines, s, e = got
         canon[name] = lines[s:e]
 
-    got = extract_region(TEMPLATE)
-    if got is None:
-        print(f"error: {TEMPLATE.name} has no register-state markers",
-              file=sys.stderr)
-        return 2
-    _lines, _s, _e = got
-    canon_region = _lines[_s:_e]
+    regions = [("the extern block", REGION_BEGIN, REGION_END),
+               ("the includes and macros", PREAMBLE_BEGIN, PREAMBLE_END)]
+    canon_regions = []
+    for label, begin, end in regions:
+        got = extract_region(TEMPLATE, begin, end)
+        if got is None:
+            print(f"error: {TEMPLATE.name} has no markers for {label}",
+                  file=sys.stderr)
+            return 2
+        _lines, _s, _e = got
+        canon_regions.append((label, begin, end, _lines[_s:_e]))
 
     drifted = 0
     for path in sorted((ROOT / "titles").glob("*/src/recomp_manual.c")):
         rel = path.relative_to(ROOT)
 
-        # The externs first: the functions below cannot compile without them,
-        # so fixing them in the other order just breaks the build.
-        got = extract_region(path)
-        if got is None:
-            print(f"{rel}: no register-state markers, cannot compare")
-            drifted += 1
-        elif got[0][got[1]:got[2]] != canon_region:
-            drifted += 1
+        # Regions first: the functions below cannot compile without the
+        # declarations and macros they use, so fixing them in the other order
+        # just breaks the build. Re-read between regions because --fix writes.
+        for label, begin, end, canon_lines in canon_regions:
+            got = extract_region(path, begin, end)
+            if got is None:
+                print(f"{rel}: no markers for {label}, cannot compare")
+                drifted += 1
+                continue
             lines, s, e = got
-            print(f"{rel}: the extern block differs from the template "
-                  f"({e - s} lines here, {len(canon_region)} there)")
+            if lines[s:e] == canon_lines:
+                continue
+            drifted += 1
+            print(f"{rel}: {label} differs from the template "
+                  f"({e - s} lines here, {len(canon_lines)} there)")
             if args.fix:
                 _, nl = read(path)
-                lines[s:e] = canon_region
+                lines[s:e] = canon_lines
                 io.open(path, "w", encoding="utf-8",
                         newline="").write(nl.join(lines))
-                print("  fixed: copied the template's extern block")
+                print(f"  fixed: copied the template's {label}")
 
         for name in SHARED:
             got = extract(path, name)

@@ -21,7 +21,35 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>   /* getenv, exit: the spin verdict below */
-#include <string.h>   /* memcpy, strcmp: the caller scan and RECOMP_ICALL_FATAL */
+#include <string.h>   /* strcmp: RECOMP_ICALL_FATAL */
+
+/* One diagnostic report, one piece.
+ *
+ * Each report below is a dozen fprintf calls and the CRT takes its lock per
+ * call, so with more than one guest thread running the lines interleave in
+ * the middle of a report. Dino Crisis 3 runs six workers once it is past its
+ * menus, and its log came out like this:
+ *
+ *   callers: 0x004DB424 <- 0x002705B4 <- 0x002705B4[ICALL] unresolved jump
+ *   target 0x41B0B870 -- 1 time(s) (total calls: 6930990)
+ *
+ * -- two threads' reports spliced together, with a caller list that stops
+ * mid-sentence and an address that belongs to neither line as read. These
+ * diagnostics exist to be read during exactly the multi-threaded bring-up
+ * that breaks them.
+ *
+ * The CRT exposes the lock these calls were already taking one at a time, so
+ * hold it across the whole report instead. */
+#if defined(_MSC_VER)
+#  define RECOMP_DIAG_LOCK()   _lock_file(stderr)
+#  define RECOMP_DIAG_UNLOCK() _unlock_file(stderr)
+#elif defined(__unix__) || defined(__APPLE__)
+#  define RECOMP_DIAG_LOCK()   flockfile(stderr)
+#  define RECOMP_DIAG_UNLOCK() funlockfile(stderr)
+#else
+#  define RECOMP_DIAG_LOCK()   ((void)0)
+#  define RECOMP_DIAG_UNLOCK() ((void)0)
+#endif
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -178,6 +206,7 @@ void recomp_icall_fail_log(uint32_t va)
             return;
     }
 
+    RECOMP_DIAG_LOCK();
     fprintf(stderr, "[ICALL] unresolved %starget 0x%08X -- %llu time(s) "
                     "(total calls: %llu)\n",
             g_icall_dispatch_form == 1 ? "call " :
@@ -228,6 +257,7 @@ void recomp_icall_fail_log(uint32_t va)
                 fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
         }
     }
+    RECOMP_DIAG_UNLOCK();
     fflush(stderr);
 }
 /* An indirect call whose target is not code: a null or wild function pointer.
@@ -306,7 +336,8 @@ void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp)
                                          + (saved_esp - 4));
         if (caller < g_xbox_code_lo || caller >= g_xbox_code_hi)
             caller = 0;
-        fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped "
+        RECOMP_DIAG_LOCK();
+    fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped "
                         "%llu time(s) via a %s",
                 va, (unsigned long long)hits[i],
                 g_icall_dispatch_form == 2 ? "jump" : "call");
@@ -393,6 +424,7 @@ void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp)
             exit(3);
         }
     }
+    RECOMP_DIAG_UNLOCK();
     fflush(stderr);
 }
 

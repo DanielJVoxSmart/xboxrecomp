@@ -405,6 +405,15 @@ struct bridge_thread_start {
     uint32_t ctx1, ctx2, stack_top;
 };
 
+/* Object kinds, for ObReferenceObjectByHandle. Declared here because the
+ * creation sites that record them come earlier in this file than the
+ * handle table itself. */
+#define BRIDGE_OBJ_UNKNOWN  0
+#define BRIDGE_OBJ_THREAD   1
+#define BRIDGE_OBJ_EVENT_M  2   /* notification / manual-reset */
+#define BRIDGE_OBJ_EVENT_A  3   /* synchronisation / auto-reset */
+static void bridge_set_handle_kind(HANDLE h, int kind);
+
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
@@ -576,6 +585,10 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
+                    /* A thread handle is signalled when the thread exits, and
+                     * a zero-timeout wait on one is a read rather than a
+                     * take -- so ObReferenceObjectByHandle may ask it. */
+                    if (th) bridge_set_handle_kind(th, BRIDGE_OBJ_THREAD);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -1404,6 +1417,14 @@ static void bridge_NtCreateEvent(void)
         XBOX_TO_NATIVE(obj_attr_ptr),
         event_type, initial_state);
 
+    if (local_handle) {
+        /* XboxNotificationEvent (0) is manual-reset and safe to poll;
+         * XboxSynchronizationEvent (1) is auto-reset and is consumed by a
+         * zero-timeout wait, so it is recorded as the kind not to ask. */
+        bridge_set_handle_kind(local_handle,
+                               event_type == 0 ? BRIDGE_OBJ_EVENT_M
+                                               : BRIDGE_OBJ_EVENT_A);
+    }
     if (handle_ptr) {
         bridge_write_handle(handle_ptr, local_handle);
     }
@@ -3011,6 +3032,21 @@ static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
  * without FILE_SYNCHRONOUS_IO_ALERT or _NONALERT. See bridge_NtReadFile. */
 static unsigned char s_handle_async[BRIDGE_HANDLE_MAX];
 
+/* What kind of object each token refers to.
+ *
+ * Needed because ObReferenceObjectByHandle has to report whether the object
+ * is signalled, and the only way to ask a host object that is
+ * WaitForSingleObject with a zero timeout -- which is a read for a thread or
+ * a manual-reset event, and a *taking* for an auto-reset event, a mutex or a
+ * semaphore. Asking the wrong kind consumes the very signal the guest is
+ * waiting for, so the kind is recorded where the object is created rather
+ * than guessed at the point of use. Unknown means do not ask. */
+static unsigned char s_handle_kind[BRIDGE_HANDLE_MAX];
+
+/* The guest-side dispatcher object synthesised for each token, or 0. */
+static uint32_t s_handle_dispatcher[BRIDGE_HANDLE_MAX];
+
+
 static uint32_t bridge_handle_token(HANDLE h)
 {
     int i;
@@ -3024,6 +3060,17 @@ static uint32_t bridge_handle_token(HANDLE h)
         }
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
+}
+
+/* Record what kind of object a native HANDLE is, for the token that holds it.
+ * Allocates the token if it does not have one yet, so callers can do this at
+ * creation time without caring whether the handle has been published. */
+static void bridge_set_handle_kind(HANDLE h, int kind)
+{
+    uint32_t token = bridge_handle_token(h);
+    uint32_t i = token & BRIDGE_HANDLE_MASK;
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG && i < BRIDGE_HANDLE_MAX)
+        s_handle_kind[i] = (unsigned char)kind;
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
@@ -4310,16 +4357,94 @@ static void bridge_IoCreateSymbolicLink(void)
                                                 target_va ? &target : NULL);
 }
 
-/* ── ObReferenceObjectByHandle (ordinal 246) ─────────────── */
+/* ── ObReferenceObjectByHandle (ordinal 246) ──────────────
+ * NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType,
+ *                                    PVOID *Object)   -- 3 args, not NT's 6
+ *
+ * This used to answer STATUS_SUCCESS and write NULL, which is the worse of
+ * the two available lies: the caller is told it holds a referenced object and
+ * is handed nothing, so every field it reads comes from guest address 0 --
+ * mapped, readable, and zero for ever.
+ *
+ * A title that waits by polling an object's signal state therefore waits for
+ * ever. Dino Crisis 3 does this at its difficulty-select screen, where it is
+ * waiting for a loader thread: ObReferenceObjectByHandle, read,
+ * ObfDereferenceObject, NtYieldExecution, 284 million times each in a
+ * 200-second run -- which is also why the title falls from 30 frames a second
+ * to 6. Nothing in the log said so, because a bridge that returns success
+ * quietly is indistinguishable from one that works.
+ *
+ * So give it a real object: a small dispatcher header in guest memory, one
+ * per handle, kept for the life of the handle, with SignalState refreshed
+ * from the host object each time the guest asks for it. That matches how the
+ * guest uses this -- it re-references on every turn of its poll -- so the
+ * refresh lands exactly where it is needed without hooking guest reads.
+ *
+ * Only for kinds where asking is free. A zero-timeout wait reads a thread or
+ * a manual-reset event and *takes* an auto-reset event, a mutex or a
+ * semaphore, so for those the header is still returned but the state is left
+ * alone, and the log says which handle went unanswered rather than silently
+ * reporting "not signalled". A returned object with an honest unknown state
+ * is still better than NULL, because at least the field offsets exist.
+ */
 static void bridge_ObReferenceObjectByHandle(void)
 {
-    /* Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType, PVOID* Object)
-     * 3 args (not 6 like Windows NT) */
-    uint32_t handle = STACK_ARG(0);
-    uint32_t obj_type = STACK_ARG(1);
+    uint32_t handle     = STACK_ARG(0);
+    uint32_t obj_type   = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
-    g_eax = 0;  /* STATUS_SUCCESS */
+    uint32_t slot       = handle & BRIDGE_HANDLE_MASK;
+    HANDLE   host       = bridge_resolve_handle(handle);
+    uint32_t disp       = 0;
+    int      kind       = BRIDGE_OBJ_UNKNOWN;
+
+    if ((handle & 0xFF000000u) == BRIDGE_HANDLE_TAG && slot < BRIDGE_HANDLE_MAX) {
+        kind = s_handle_kind[slot];
+        disp = s_handle_dispatcher[slot];
+        if (!disp && host) {
+            /* DISPATCHER_HEADER is 16 bytes: Type, Absolute, Size, Inserted,
+             * LONG SignalState, LIST_ENTRY WaitListHead. Allocate a little
+             * more so a caller reading a KEVENT or a KTHREAD prologue past
+             * the header finds mapped zeroes rather than a fault. */
+            disp = xbox_HeapAlloc(64, 16);
+            if (disp) {
+                memset((uint8_t *)g_xbox_mem_offset + disp, 0, 64);
+                /* WaitListHead is a circular list and empty means it points
+                 * at itself; a guest walking it otherwise runs off into
+                 * whatever zero happens to address. */
+                BRIDGE_MEM32(disp + 8) = disp + 8;
+                BRIDGE_MEM32(disp + 12) = disp + 8;
+                s_handle_dispatcher[slot] = disp;
+            }
+        }
+    }
+
+    if (disp && host &&
+        (kind == BRIDGE_OBJ_THREAD || kind == BRIDGE_OBJ_EVENT_M)) {
+        DWORD r = WaitForSingleObject(host, 0);
+        BRIDGE_MEM32(disp + 4) = (r == WAIT_OBJECT_0) ? 1u : 0u;
+    }
+
+    {
+        static uint64_t calls = 0;
+        static uint64_t say_at = 1;
+        if (++calls >= say_at) {
+            say_at *= 10;
+            fprintf(stderr, "  [KERNEL] ObReferenceObjectByHandle: "
+                    "handle=0x%08X type=0x%08X -> object 0x%08X, "
+                    "kind=%s, signalled=%u (call %llu)\n",
+                    handle, obj_type, disp,
+                    kind == BRIDGE_OBJ_THREAD  ? "thread"
+                  : kind == BRIDGE_OBJ_EVENT_M ? "event/manual"
+                  : kind == BRIDGE_OBJ_EVENT_A ? "event/auto (not polled)"
+                                               : "unknown (not polled)",
+                    disp ? BRIDGE_MEM32(disp + 4) : 0u,
+                    (unsigned long long)calls);
+            fflush(stderr);
+        }
+    }
+
+    if (object_ptr) BRIDGE_MEM32(object_ptr) = disp;
+    g_eax = disp ? 0 : (uint32_t)0xC0000008u;   /* STATUS_INVALID_HANDLE */
 }
 
 /* ── RtlRaiseException (ordinal 302) ─────────────────────
@@ -8084,6 +8209,10 @@ static void bridge_PsCreateSystemThread(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
+                    /* A thread handle is signalled when the thread exits, and
+                     * a zero-timeout wait on one is a read rather than a
+                     * take -- so ObReferenceObjectByHandle may ask it. */
+                    if (th) bridge_set_handle_kind(th, BRIDGE_OBJ_THREAD);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
