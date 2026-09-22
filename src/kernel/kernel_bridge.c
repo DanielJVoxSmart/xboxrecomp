@@ -4400,11 +4400,52 @@ static void bridge_ObReferenceObjectByHandle(void)
     HANDLE   host       = bridge_resolve_handle(handle);
     uint32_t disp       = 0;
     int      kind       = BRIDGE_OBJ_UNKNOWN;
+    uint32_t *slot_disp = NULL;
+
+    /* Handles that are not in the table still get an object.
+     *
+     * NtCurrentThread is (HANDLE)-2 and NtCurrentProcess (HANDLE)-1, and
+     * ObReferenceObjectByHandle(NtCurrentThread, ...) is an ordinary thing
+     * for a title to do -- TimeSplitters: Future Perfect does it during
+     * start-up. Those are pseudo-handles, so they are never in the handle
+     * table, and answering STATUS_INVALID_HANDLE for them is a regression
+     * this function introduced: before it returned success with a NULL
+     * object, which was wrong in a different way but which a title asking
+     * about itself could survive.
+     *
+     * So: synthesise a header for any handle, tagged or not, and keep the
+     * signal state honest by simply not claiming to know it for the ones
+     * whose kind was never recorded. A small side table, because pseudo-
+     * handles have no slot to hang it off. */
+    {
+        enum { PSEUDO_MAX = 16 };
+        static uint32_t pseudo_handle[PSEUDO_MAX];
+        static uint32_t pseudo_disp[PSEUDO_MAX];
+        static int pseudo_count;
+        int i;
+        if ((handle & 0xFF000000u) != BRIDGE_HANDLE_TAG && handle) {
+            for (i = 0; i < pseudo_count; i++)
+                if (pseudo_handle[i] == handle)
+                    break;
+            if (i == pseudo_count && pseudo_count < PSEUDO_MAX) {
+                pseudo_handle[pseudo_count] = handle;
+                pseudo_disp[pseudo_count] = 0;
+                pseudo_count++;
+            }
+            if (i < PSEUDO_MAX && pseudo_handle[i] == handle) {
+                slot_disp = &pseudo_disp[i];
+                disp = *slot_disp;
+            }
+        }
+    }
 
     if ((handle & 0xFF000000u) == BRIDGE_HANDLE_TAG && slot < BRIDGE_HANDLE_MAX) {
         kind = s_handle_kind[slot];
         disp = s_handle_dispatcher[slot];
-        if (!disp && host) {
+        slot_disp = &s_handle_dispatcher[slot];
+    }
+    {
+        if (!disp && slot_disp) {
             /* DISPATCHER_HEADER is 16 bytes: Type, Absolute, Size, Inserted,
              * LONG SignalState, LIST_ENTRY WaitListHead. Allocate a little
              * more so a caller reading a KEVENT or a KTHREAD prologue past
@@ -4417,7 +4458,7 @@ static void bridge_ObReferenceObjectByHandle(void)
                  * whatever zero happens to address. */
                 BRIDGE_MEM32(disp + 8) = disp + 8;
                 BRIDGE_MEM32(disp + 12) = disp + 8;
-                s_handle_dispatcher[slot] = disp;
+                *slot_disp = disp;
             }
         }
     }
@@ -4448,6 +4489,7 @@ static void bridge_ObReferenceObjectByHandle(void)
     }
 
     if (object_ptr) BRIDGE_MEM32(object_ptr) = disp;
+    /* Only a handle we can make nothing of at all is invalid. */
     g_eax = disp ? 0 : (uint32_t)0xC0000008u;   /* STATUS_INVALID_HANDLE */
 }
 
