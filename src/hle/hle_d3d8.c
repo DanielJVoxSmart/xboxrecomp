@@ -741,6 +741,11 @@ static unsigned long g_inline_begin_frame, g_inline_vdata_frame;
 static unsigned long g_inline_begin_max, g_inline_vdata_max;
 /* From hle_d3d8_texture.c: stage 0 holds the title's own frame. */
 int hle_d3d8_stage0_is_framebuffer(void);
+uint32_t hle_d3d8_guest_render_state(uint32_t xbox_state);
+uint32_t hle_d3d8_guest_texture_state(uint32_t stage, uint32_t xbox_slot);
+uint32_t hle_d3d8_guest_pixel_shader(void);
+uint32_t d3d8_combiners_current_hash(void);
+double hle_d3d8_stage0_framebuffer_mean(void);
 /* Draws arriving on a guest thread other than the one that swaps. A loader
  * thread drawing to warm caches puts geometry through the host that no
  * presented frame ever contains -- it would count as drawn and never show. */
@@ -802,14 +807,15 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
     /* RECOMP_HLE_D3D8_SKIP_FULLSCREEN=1: drop the title's full-screen passes
      * over its own frame -- the draws that sample the frame buffer at stage 0.
      *
-     * This is a measurement, and a crude workaround. Those passes remove a
-     * fixed share of the light in every frame (0.62 of it on TimeSplitters 2's
-     * snow level, 0.367 on another, constant within a level to a standard
-     * deviation of 0.002), which is the brightness bug in
-     * docs/technical/timesplitters2-open-issues.md. Turning them off says
-     * whether they own that loss outright, and gives a bright picture without
-     * whatever they were for -- bloom or glow, on the evidence of a fixed
-     * one-texel offset repeated three times with descending alpha. */
+     * A measurement, kept. These passes used to take two thirds of
+     * TimeSplitters 2's light, because a linear texture is addressed in texels
+     * and the sample landed outside the frame buffer and read black; that is
+     * fixed (d3d8_format_is_linear, and tex_scale in the two pixel-shader
+     * paths), and with it fixed these passes are neutral to a tenth of a grey
+     * level. The switch stays because it isolates a whole class of effect --
+     * anything a title draws over its finished frame -- from the frame under
+     * it, which is the first question to ask when a picture is wrong and the
+     * scene behind it is not. */
     {
         static int skip = -1;
         if (skip < 0)
@@ -819,9 +825,24 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
             return 0;
         }
     }
+
     /* The title's render and texture stage states as they stand now, read
      * from its own state arrays (hle_d3d8_state.c). */
     hle_d3d8_shadow_apply_states(g_shadow);
+
+    /* RECOMP_HLE_D3D8_FS_NOBLEND=1: the title's full-screen passes with
+     * blending off, so each writes its shader's result straight out.
+     * Pair it with RECOMP_D3D8_PS_SHOW and the trace's dumps: with the
+     * blend in the way, a black result and a zero source alpha leave the
+     * same picture, and the whole question is which one it is. */
+    {
+        static int off = -1;
+
+        if (off < 0)
+            off = getenv("RECOMP_HLE_D3D8_FS_NOBLEND") ? 1 : 0;
+        if (off && hle_d3d8_stage0_is_framebuffer())
+            host_SetRenderState(g_shadow, D3DRS_ALPHABLENDENABLE, FALSE);
+    }
     g_frame_draws++;
     return 1;
 }
@@ -850,14 +871,45 @@ static void shadow_dump_next_frame(void)
  * replaying these draws samples a black texture and answers a different
  * question; two diagnoses of the TimeSplitters 2 brightness bug died of that.
  * Standing still and then moving with this on is the whole experiment. */
-static void shadow_frame_brightness(void)
+/* The mean of the back buffer's three colour channels, sparsely sampled, or
+ * -1 if it cannot be read. Both the whole-frame reading below and the
+ * per-pass trace further down are this same number at different moments.
+ *
+ * R8G8B8A8, every sixteenth pixel: enough for a mean, cheap enough that the
+ * readback stall does not change what is being measured. */
+static double shadow_backbuffer_mean(void)
 {
-    static int every = -1;
     IDirect3DSurface8 *surf = NULL;
     D3DLOCKED_RECT lr;
     unsigned long long sum = 0;
     unsigned samples = 0;
     UINT x, y;
+
+    if (!g_shadow)
+        return -1.0;
+    if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
+        return -1.0;
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        surf->lpVtbl->Release(surf);
+        return -1.0;
+    }
+    for (y = 0; y < g_shadow_height; y += 16) {
+        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
+        for (x = 0; x < g_shadow_width; x += 16) {
+            const uint8_t *px = row + (size_t)x * 4u;
+            sum += (unsigned)px[0] + px[1] + px[2];
+            samples += 3;
+        }
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+    return samples ? (double)sum / samples : 0.0;
+}
+
+static void shadow_frame_brightness(void)
+{
+    static int every = -1;
+    double mean;
 
     if (every < 0) {
         const char *v = getenv("RECOMP_HLE_D3D8_BRIGHT");
@@ -865,30 +917,174 @@ static void shadow_frame_brightness(void)
     }
     if (!every || !g_shadow || (g_shadow_swaps % (unsigned long)every) != 0)
         return;
+    mean = shadow_backbuffer_mean();
+    if (mean < 0.0)
+        return;
 
+    fprintf(stderr, "[HLE-D3D8] frame brightness swap %lu: after everything, "
+            "mean %.1f/255 over %lu draws\n", g_shadow_swaps, mean, g_frame_draws);
+    fflush(stderr);
+}
+
+/* RECOMP_HLE_D3D8_FS_TRACE=<n>: every n swaps, follow the title's own
+ * full-screen passes -- the draws that sample its frame at stage 0 -- one
+ * at a time, and read the back buffer either side of each.
+ *
+ * RECOMP_HLE_D3D8_BRIGHT and RECOMP_HLE_D3D8_FB_PROBE between them say the
+ * passes take two thirds of the light and that the copy they sample holds
+ * the picture, which leaves the question of which pass takes it and what
+ * it was asked to do. This answers both in one line per pass: the blend,
+ * the stage 0 operation, the pixel shader object bound, the first vertex's
+ * colour, and the mean before and after.
+ *
+ * A readback per pass is a stall, so this belongs on an interval, not on.
+ * Pair it with RECOMP_D3D8_PS_DUMP to read the shader each line names. */
+/* The back buffer as it stands, written to one BMP. shadow_dump_frame below
+ * writes the same picture on an interval at Swap; this one is for the trace,
+ * which wants it mid-frame and named after the pass. */
+static void fs_trace_write_bmp(const char *path)
+{
+    IDirect3DSurface8 *surf = NULL;
+    D3DSURFACE_DESC sd;
+    D3DLOCKED_RECT lr;
+    uint8_t hdr[54];
+    UINT w, h, x, y, pad;
+    uint32_t filesz;
+    FILE *f;
+
+    if (!g_shadow)
+        return;
     if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
         return;
+    if (FAILED(surf->lpVtbl->GetDesc(surf, &sd)) || !sd.Width || !sd.Height) {
+        surf->lpVtbl->Release(surf);
+        return;
+    }
     if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
         surf->lpVtbl->Release(surf);
         return;
     }
-    /* R8G8B8A8, sparsely sampled: enough for a mean, cheap enough that the
-     * readback stall does not change what is being measured. */
-    for (y = 0; y < g_shadow_height; y += 16) {
-        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
-        for (x = 0; x < g_shadow_width; x += 16) {
-            const uint8_t *p = row + (size_t)x * 4u;
-            sum += (unsigned)p[0] + p[1] + p[2];
-            samples += 3;
+    w = sd.Width;
+    h = sd.Height;
+    pad = (4 - ((w * 3) & 3)) & 3;
+    filesz = 54 + (w * 3 + pad) * h;
+    f = fopen(path, "wb");
+    if (f) {
+        memset(hdr, 0, sizeof hdr);
+        hdr[0] = 'B'; hdr[1] = 'M';
+        memcpy(hdr + 2, &filesz, 4);
+        hdr[10] = 54;
+        hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4);
+        memcpy(hdr + 22, &h, 4);
+        hdr[26] = 1;
+        hdr[28] = 24;
+        fwrite(hdr, 1, sizeof hdr, f);
+        for (y = h; y-- > 0; ) {
+            const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
+            for (x = 0; x < w; x++) {
+                const uint8_t *px = row + x * 4;
+                uint8_t bgr[3] = { px[2], px[1], px[0] };
+                fwrite(bgr, 1, 3, f);
+            }
+            fwrite("\0\0\0", 1, pad, f);
         }
+        fclose(f);
     }
     surf->lpVtbl->UnlockRect(surf);
     surf->lpVtbl->Release(surf);
+}
 
-    fprintf(stderr, "[HLE-D3D8] frame brightness swap %lu: after everything, "
-            "mean %.1f/255 over %lu draws\n", g_shadow_swaps,
-            samples ? (double)sum / samples : 0.0, g_frame_draws);
+static int fs_trace_this_swap(void)
+{
+    static int every = -1;
+
+    if (every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_FS_TRACE");
+        every = (v && atoi(v) > 0) ? atoi(v) : 0;
+    }
+    return every && g_shadow && (g_shadow_swaps % (unsigned long)every) == 0;
+}
+
+static double g_fs_before = -1.0;
+
+/* RECOMP_HLE_D3D8_FS_TRACE_DUMP=<prefix>: the back buffer either side of
+ * every traced pass, as <prefix><swap>_<pass><in|out>.bmp. The means in the
+ * trace line say how much light a pass takes; these say from where, which
+ * is the difference between a pass that dims the picture and one that
+ * covers part of it. */
+static int g_fs_pass;
+
+static void fs_trace_dump(const char *what)
+{
+    static const char *prefix;
+    static int asked;
+    char path[512];
+
+    if (!asked) {
+        asked = 1;
+        prefix = getenv("RECOMP_HLE_D3D8_FS_TRACE_DUMP");
+    }
+    if (!prefix)
+        return;
+    snprintf(path, sizeof path, "%s%05lu_%d%s.bmp", prefix,
+             g_shadow_swaps, g_fs_pass, what);
+    fs_trace_write_bmp(path);
+}
+
+static void fs_trace_before(void)
+{
+    static unsigned long swap;
+
+    g_fs_before = -1.0;
+    if (swap != g_shadow_swaps) {
+        swap = g_shadow_swaps;
+        g_fs_pass = 0;
+    }
+    if (!fs_trace_this_swap() || !hle_d3d8_stage0_is_framebuffer())
+        return;
+    g_fs_before = shadow_backbuffer_mean();
+    fs_trace_dump("in");
+}
+
+/* The first vertex is printed raw rather than decoded: the full-screen
+ * quads come through more than one vertex layout and the colour's offset
+ * is not fixed, so the bytes say more than a guess at which four are the
+ * D3DCOLOR. */
+static void fs_trace_after(const void *verts, uint32_t stride,
+                           D3DPRIMITIVETYPE pt, UINT prims)
+{
+    double after, t0;
+    uint32_t i, n;
+
+    if (g_fs_before < 0.0)
+        return;
+    t0 = hle_d3d8_stage0_framebuffer_mean();
+    after = shadow_backbuffer_mean();
+    fprintf(stderr, "[FS] swap %lu pass %d: mean %.1f -> %.1f | blend=%u "
+            "src=0x%X dst=0x%X | colorop=%u arg1=0x%X arg2=0x%X | ps=0x%08X "
+            "| combiner=%08X | t0 mean %.1f | addr=%u,%u filt=%u,%u,%u "
+            "lod=%u maxmip=%u aniso=%u | pt=%u prims=%u stride=%u v:",
+            g_shadow_swaps, g_fs_pass, g_fs_before, after,
+            hle_d3d8_guest_render_state(59), hle_d3d8_guest_render_state(62),
+            hle_d3d8_guest_render_state(63), hle_d3d8_guest_texture_state(0, 12),
+            hle_d3d8_guest_texture_state(0, 14), hle_d3d8_guest_texture_state(0, 15),
+            hle_d3d8_guest_pixel_shader(), d3d8_combiners_current_hash(),
+            t0,
+            hle_d3d8_guest_texture_state(0, 0), hle_d3d8_guest_texture_state(0, 1),
+            hle_d3d8_guest_texture_state(0, 3), hle_d3d8_guest_texture_state(0, 4),
+            hle_d3d8_guest_texture_state(0, 5), hle_d3d8_guest_texture_state(0, 6),
+            hle_d3d8_guest_texture_state(0, 7), hle_d3d8_guest_texture_state(0, 8),
+            (unsigned)pt, (unsigned)prims, stride);
+    n = stride * 4u;                 /* the first four vertices: a quad's corners */
+    for (i = 0; verts && i < n && i < 128u; i++)
+        fprintf(stderr, (i && i % stride == 0) ? " |%02X" : " %02X",
+                ((const uint8_t *)verts)[i]);
+    fprintf(stderr, "\n");
     fflush(stderr);
+    fs_trace_dump("out");
+    g_fs_pass++;
+    g_fs_before = -1.0;
 }
 
 static void shadow_dump_frame(void)
@@ -2777,7 +2973,9 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
         memcpy(loop + (size_t)count * host_stride, verts, host_stride);
         verts = loop;
     }
+    fs_trace_before();
     hr = host_DrawPrimitiveUP(g_shadow, pt, prims, verts, host_stride);
+    fs_trace_after(verts, host_stride, pt, prims);
     free(loop);
     free(expanded);
     if (FAILED(hr))
@@ -2878,9 +3076,11 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         g_draws_failed++;
         return;
     }
+    fs_trace_before();
     hr = host_DrawIndexedPrimitiveUP(
         g_shadow, pt, 0, vertices, prims, list ? list : idx, D3DFMT_INDEX16,
         expanded ? expanded : verts, host_stride);
+    fs_trace_after(expanded ? expanded : verts, host_stride, pt, prims);
     free(list);
     free(expanded);
     if (FAILED(hr))

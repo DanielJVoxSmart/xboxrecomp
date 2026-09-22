@@ -828,6 +828,44 @@ HLE_EXPORT(D3DDevice_SetTexture)
 #endif
 }
 
+/* The mean of the three colour channels of the screen copy bound at stage 0,
+ * or -1 when stage 0 does not hold one. Same sparse grid and the same read
+ * through the surface as framebuffer_probe above, for the same reason: the
+ * texture's LockRect returns the upload shadow, which the screen copy never
+ * writes.
+ *
+ * This is what the full-screen passes multiply the frame by, so a trace of
+ * those passes needs it beside the frame's own mean to check the shader's
+ * arithmetic against the picture. */
+double hle_d3d8_stage0_framebuffer_mean(void)
+{
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    unsigned long long sum = 0;
+    unsigned samples = 0;
+    UINT x, y;
+
+    if (!g_stage0_framebuffer || !g_bound[0])
+        return -1.0;
+    if (FAILED(g_bound[0]->lpVtbl->GetSurfaceLevel(g_bound[0], 0, &surf)) || !surf)
+        return -1.0;
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        surf->lpVtbl->Release(surf);
+        return -1.0;
+    }
+    for (y = 0; y < 480u; y += 16) {
+        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
+        for (x = 0; x < 640u; x += 16) {
+            const uint8_t *px = row + (size_t)x * 4u;
+            sum += (unsigned)px[0] + px[1] + px[2];
+            samples += 3;
+        }
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+    return samples ? (double)sum / samples : 0.0;
+}
+
 /* Does the draw about to be made sample the title's own frame at stage 0?
  *
  * That is what its full-screen passes do and what nothing else does, so it

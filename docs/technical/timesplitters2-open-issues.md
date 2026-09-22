@@ -11,7 +11,65 @@ is how it got there.
 
 ---
 
-## 1. The picture is about a third of xemu's brightness
+## 1. ~~The picture is about a third of xemu's brightness~~ — fixed
+
+**Resolved 22 September 2026.** The frame is no longer dark: the driven snow-level
+session that measured 20.3/255 now measures 53.5/255, and each of the three
+full-screen passes is neutral to within a tenth of a grey level (56.3 -> 56.4 ->
+56.5 -> 56.5) instead of taking half the light. That matches the control
+measurement with the passes skipped entirely (53.0), so the light is back *and*
+the glow those passes are for is doing its job.
+
+**The cause was not in these passes at all. It was one line of texture
+addressing, and it was never TimeSplitters-specific.**
+
+The NV2A addresses a *linear* (unswizzled) texture in texels, not in normalised
+[0,1] coordinates. The frame buffer the title samples is `X_D3DFMT_LIN_A8R8G8B8`
+(0x12), so the title correctly hands the texture unit pixel coordinates. Its
+vertex program is three instructions and says so outright:
+
+```hlsl
+oPos = v1;
+oD0  = v2.wxyz;
+oT0  = v3 * c[11];      /* c[11] = (640, 480, 1, 1) */
+```
+
+The UVs in the vertex buffer are the expected `1/640, 1/480`; `c[11]` turns them
+into pixels. D3D11 has only normalised sampling, so every sample landed far
+outside the texture, clamped to one corner texel, and came back as good as
+black. `out = t0*a + dst*(1-a)` with `t0 = 0` is `out = dst*(1-a)` -- the passes
+were multiplying the frame down by their own alpha, three times a frame. The
+level-to-level variation in the ratio (0.62, 0.53, 0.367) was just the alphas
+each level's passes happened to use.
+
+**The fix** landed with the Future Perfect bring-up (#17), which hit the same
+gap from the other side -- that title's colour-grading pass samples its frame
+buffer the same way and came out a single flat colour. It is
+`d3d8_format_is_linear()` (`src/d3d/d3d8_resources.c`) plus a
+per-stage `tex_scale` in both pixel-shader paths (`src/d3d/d3d8_combiners.c` for
+the register combiners, `src/d3d/d3d8_shaders.c` for fixed function): a stage
+holding a linear texture multiplies its coordinates by `1/width, 1/height`
+before the sample, and every other stage multiplies by one. This is a general
+gap in the D3D8-to-D3D11 translation; any title sampling a linear texture was
+affected, and the frame-buffer read is simply where it shows up worst.
+
+**Why it took three attempts.** Every measurement of the passes was correct and
+every conclusion drawn from them was wrong, because all three probes available
+looked at the *resource* and none looked at the *sample*. The screen copy was
+arriving (`FB_PROBE` read it back: mean 55.5). The right view was bound at the
+right slot. A sampler was bound. The coordinates were finite. What finally
+separated them was fetching the same texel two ways in the same draw --
+`RECOMP_D3D8_PS_SHOW=t0lod` renders `Sample` and `Load` side by side -- which
+read 0.0 through the sampler and 79.8 without it. A texture can be full, bound
+and correctly viewed and still sample as black; ask the sample, not the
+resource.
+
+What follows is the investigation as it stood, kept because the measurement
+technique outlived the diagnosis.
+
+---
+
+### The bug as originally reported
 
 **The most visible thing wrong, and the least understood.** Same surfaces,
 measured from a screenshot of each:

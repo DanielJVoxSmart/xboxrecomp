@@ -456,6 +456,34 @@ The Xbox D3D8 includes a NV2A push buffer interface for direct GPU command submi
 - Push buffer creation functions are stubbed to return success.
 - Any function that spin-waits on GPU registers (`while (MEM32(0xFD00XXXX) & flag)`) must be stubbed entirely, not just the register read. Allocating the page via VEH prevents the crash but the loop spins forever on zero.
 
+### Linear Textures Are Addressed in Texels
+
+A texture in one of the Xbox's linear (`X_D3DFMT_LIN_*`) formats is sampled with
+coordinates in **texels**, not in normalised [0,1] space. Swizzled and
+compressed formats are normalised as on the PC. This is a property of the
+texture unit, not of the title, so a correct title hands the hardware pixel
+coordinates for those textures and there is nothing in its code to flag it.
+
+D3D11 samples only in normalised coordinates, so the translation divides by the
+texture's size before the sample. Each pixel-shader path carries a per-stage
+`tex_scale` in its constant buffer -- `1/width, 1/height` where the bound
+texture's format is linear, `1, 1` otherwise:
+
+| path | constant | set in |
+| --- | --- | --- |
+| register combiners | `tex_scale[4]` | `src/d3d/d3d8_combiners.c` |
+| fixed function | `TexScale[4]` | `src/d3d/d3d8_shaders.c` |
+
+`d3d8_format_is_linear()` in `src/d3d/d3d8_resources.c` is the test.
+
+Getting this wrong is close to invisible in most frames -- a stray texture
+samples its own edge -- and catastrophic in the one case that matters, a title
+sampling its own frame buffer for a glow or blur, because the frame buffer is
+always linear. TimeSplitters 2 lost two thirds of its light this way and it
+took three separate investigations to find, since the texture, the view and the
+sampler are all correct and only the coordinate is wrong. See
+`frame-brightness-investigation.md`.
+
 ### Tiled Memory
 
 Xbox D3D8 supports tiled render targets for the NV2A's tile-based rendering. These are stubbed -- D3D11 handles render targets internally.
