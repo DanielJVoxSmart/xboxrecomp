@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "recomp_config.h"
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
  *
@@ -651,7 +652,7 @@ int xbox_EnvSwitch(const char *name, int default_on)
 static int flip_gate_divisor(void)
 {
     if (g_flip_gate_divisor < 0) {
-        const char *cap = getenv("RECOMP_FPS_CAP");
+        const char *cap = recomp_config_lookup("RECOMP_FPS_CAP", "frame_cap");
         const char *hz = getenv("RECOMP_VBLANK_HZ");
         int vblank = hz && atoi(hz) > 0 ? atoi(hz) : 60;
         int d = 1;                                      /* adaptive unless asked */
@@ -1708,6 +1709,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
             /* The bound above reaches past the region word, so the title
              * name at +0x0C is already known to be inside the file. */
+            /* The settings file is named for the title, so the id goes
+             * over as soon as it is known -- before anything reads a
+             * setting, since nothing has drawn yet. */
+            recomp_config_set_title(*(const uint32_t *)(xbe + cert_off + 0x08));
+
             xbe_title_name_store((const unsigned char *)xbe + cert_off + CERT_TITLE_NAME);
             if (g_xbe_title_name[0])
                 fprintf(stderr, "  XBE certificate: title \"%s\"\n", g_xbe_title_name);

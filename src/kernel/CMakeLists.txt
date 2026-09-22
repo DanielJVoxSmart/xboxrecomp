@@ -40,6 +40,7 @@ target_include_directories(xbox_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${XBOXRECOMP_SRC_DIR}
 )
+target_link_libraries(xbox_kernel PUBLIC xbox_config)
 
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
