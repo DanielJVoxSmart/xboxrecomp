@@ -122,6 +122,45 @@ static int                g_shadow_thread_notes;
 static unsigned long      g_shadow_clears;
 static unsigned long      g_shadow_swaps;
 static uint32_t           g_shadow_last_color;
+
+/* RECOMP_HLE_D3D8_TRACE_SWAPS=<from>-<to>: one line per render-target set,
+ * clear, back-buffer query, copy and swap while the swap count is in that
+ * range, so the order of a title's frame can be read rather than inferred
+ * from totals. Frame dumps say what a frame looked like; this says what the
+ * title asked for to get there. Two or three frames is plenty. */
+static int shadow_trace_on(void)
+{
+    static long from = -1, to = -1;
+
+    if (from < 0) {
+        const char *e = getenv("RECOMP_HLE_D3D8_TRACE_SWAPS");
+        from = to = 0;
+        if (e && *e) {
+            char *end;
+            from = strtol(e, &end, 10);
+            to = (*end == '-') ? strtol(end + 1, NULL, 10) : from;
+        }
+    }
+    return to > 0 && (long)g_shadow_swaps >= from && (long)g_shadow_swaps <= to;
+}
+
+/* For the texture layer's SetTexture line in the same trace. */
+int hle_d3d8_trace_on(void)
+{
+    return shadow_trace_on();
+}
+
+/* The device's swap effect, from the title's D3DPRESENT_PARAMETERS
+ * (D3DSWAPEFFECT_DISCARD 1, FLIP 2, COPY 3, COPY_VSYNC 4). Reported at
+ * CreateDevice because it changes what a Swap does inside the XDK: a
+ * copy-effect device copies back to front in Swap, or leaves that to the
+ * title's swap callback when the title passes D3DSWAP_BYPASSCOPY (0x2).
+ * TimeSplitters: Future Perfect is such a title: its callback draws the
+ * back buffer through a colour-grading combiner into the front buffer,
+ * inside Swap's own body, and follows with a Swap(D3DSWAP_FINISH) that
+ * draws nothing. Every Swap still presents here; the second present of a
+ * pair shows the same frame again, which is harmless. */
+static uint32_t g_swap_effect;
 static DWORD              g_shadow_last_report;
 
 static int shadow_requested(void)
@@ -259,6 +298,46 @@ static HWND shadow_window(UINT width, UINT height)
  * device's own depth surface (shadow_set_render_target). */
 static int      g_in_create_device;
 static uint32_t g_backbuffer_va, g_autodepth_va;
+
+/* The frame buffers' data pointers: the surface CreateDevice set as the
+ * target, and every surface GetBackBuffer2 has returned. A surface is the
+ * screen when its data pointer is one of these, whatever object it hangs
+ * off. TimeSplitters: Future Perfect wraps a frame buffer (data 0x00204000)
+ * in a texture of its own (0x00563154, via XGSetTextureHeader), takes a
+ * surface of that texture each frame and draws its whole frame into it;
+ * judged by parent alone that surface was "a render target texture" and
+ * every draw went into a host texture nothing ever presented, leaving the
+ * screen white. */
+#define SWAP_SURFACES 4
+static uint32_t g_swap_data[SWAP_SURFACES];
+static int      g_nswap;
+
+static void note_swap_surface(uint32_t va)
+{
+    uint32_t data;
+    int i;
+
+    if (!va)
+        return;
+    data = HLE_MEM32(va + 4);
+    if (!data)
+        return;
+    for (i = 0; i < g_nswap; i++)
+        if (g_swap_data[i] == data)
+            return;
+    if (g_nswap < SWAP_SURFACES)
+        g_swap_data[g_nswap++] = data;
+}
+
+static int is_swap_data(uint32_t data)
+{
+    int i;
+
+    for (i = 0; i < g_nswap; i++)
+        if (data && g_swap_data[i] == data)
+            return 1;
+    return 0;
+}
 
 /* Where the frame buffer lives, as physical addresses. A title that
  * post-processes its own image does not copy the screen anywhere: it makes
@@ -1229,6 +1308,16 @@ HLE_EXPORT(Direct3D_CreateDevice)
         mirror_swap_throttle();
 #ifdef _WIN32
     g_in_create_device = 0;
+    if (pp_va) {
+        /* D3DPRESENT_PARAMETERS: BackBufferCount +0xC, SwapEffect +0x14,
+         * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
+         * decides what a Swap means (frame_end_shadow). */
+        g_swap_effect = HLE_MEM32(pp_va + 0x14);
+        fprintf(stderr, "[HLE-D3D8] CreateDevice: %u back buffer(s), swap effect %u "
+                "(1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
+                "presentation interval 0x%08X\n", HLE_MEM32(pp_va + 0xC),
+                g_swap_effect, HLE_MEM32(pp_va + 0x28), HLE_MEM32(pp_va + 0x30));
+    }
     if (!g_backbuffer_va)
         fprintf(stderr, "[HLE-D3D8] CreateDevice set no render target; the back "
                 "buffer is taken to be any parentless surface of its size\n");
@@ -1263,6 +1352,9 @@ HLE_EXPORT(D3DDevice_Clear)
         host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
         g_shadow_clears++;
         g_shadow_last_color = color;
+        if (shadow_trace_on())
+            fprintf(stderr, "[TRACE swap %lu] Clear flags 0x%X color 0x%08X\n",
+                    g_shadow_swaps, flags, color);
     }
 #endif
 }
@@ -1454,6 +1546,10 @@ HLE_EXPORT(D3DDevice_Swap)
 #ifdef _WIN32
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+    if (shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] Swap flags 0x%X (back buffer 0x%08X data 0x%08X)\n",
+                g_shadow_swaps, HLE_ARG(0), g_backbuffer_va,
+                g_backbuffer_va ? HLE_MEM32(g_backbuffer_va + 4) : 0);
 #endif
     first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
@@ -2324,6 +2420,14 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             } else {
                 kind = 2;
             }
+        } else if (is_swap_data(HLE_MEM32(rt + 4))) {
+            /* The surface's memory is a frame buffer, so this is the screen
+             * even when the surface hangs off a texture the title made over
+             * that memory (see g_swap_data). Measured on Future Perfect,
+             * frame 900 of a capture: all 110 draws of its front end went to
+             * a surface of texture 0x00563154, whose data is the frame
+             * buffer 0x00204000, and none to either swap surface. */
+            kind = 0;
         } else if (parent && HLE_MEM32(parent + 4) == HLE_MEM32(rt + 4)) {
             texture = hle_d3d8_render_texture(g_shadow, parent);   /* level 0 */
             target = (IDirect3DBaseTexture8 *)texture;
@@ -2363,16 +2467,30 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             target = (IDirect3DBaseTexture8 *)texture;
             g_target_scratch++;
         }
+        if (shadow_trace_on())
+            fprintf(stderr, "[TRACE swap %lu] SetRenderTarget 0x%08X data 0x%08X parent 0x%08X "
+                    "%ux%u zs 0x%08X -> %s\n", g_shadow_swaps, rt, HLE_MEM32(rt + 4),
+                    parent, w, h, zs,
+                    kind == 0 ? "back buffer" : kind == 1 ? "render target texture"
+                                  : kind == 3 ? "cube face" : "scratch target");
         for (i = 0; i < nseen && (seen[i].va != rt || seen[i].kind != kind); i++)
             ;
         if (i == nseen && nseen < (int)(sizeof seen / sizeof seen[0])) {
             seen[nseen].va = rt;
             seen[nseen++].kind = kind;
+            /* The data pointers matter as much as the parent: a title can
+             * wrap its frame buffer in a texture of its own (XGSetTextureHeader
+             * over the same memory), and then a surface whose parent is that
+             * texture *is* the screen, however it is named. */
             fprintf(stderr, "[HLE-D3D8] shadow render target 0x%08X: %ux%u format 0x%02X, "
-                    "parent 0x%08X (format 0x%08X) -> %s\n", rt, w, h, fmt, parent,
+                    "data 0x%08X, parent 0x%08X (format 0x%08X, data 0x%08X) -> %s"
+                    " [back buffer 0x%08X data 0x%08X]\n", rt, w, h, fmt,
+                    HLE_MEM32(rt + 4), parent,
                     parent ? HLE_MEM32(parent + 12) : 0,
+                    parent ? HLE_MEM32(parent + 4) : 0,
                     kind == 0 ? "back buffer" : kind == 1 ? "render target texture"
-                                  : kind == 3 ? "cube face" : "scratch target");
+                                  : kind == 3 ? "cube face" : "scratch target",
+                    g_backbuffer_va, g_backbuffer_va ? HLE_MEM32(g_backbuffer_va + 4) : 0);
             /* Where in its container this face sits, so a title whose cube
              * this code reads wrongly can be told apart from one it cannot
              * read at all. hle_d3d8_cube_face does the arithmetic; this
@@ -2453,6 +2571,7 @@ HLE_EXPORT(D3DDevice_SetRenderTarget)
     if (g_in_create_device && rt) {
         g_backbuffer_va = rt;
         g_autodepth_va = zs;
+        note_swap_surface(rt);
         fprintf(stderr, "[HLE-D3D8] CreateDevice set target 0x%08X, depth 0x%08X: "
                 "the frame buffer and the device's depth\n", rt, zs);
     }
@@ -2475,8 +2594,14 @@ HLE_EXPORT(D3DDevice_GetBackBuffer2)
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_GetBackBuffer2);
 #ifdef _WIN32
-    if (g_shadow && g_eax && (int32_t)HLE_ARG(0) <= 0)
+    if (g_shadow && g_eax && (int32_t)HLE_ARG(0) <= 0) {
         g_backbuffer_va = g_eax;
+        note_swap_surface(g_eax);
+    }
+    if (g_shadow && shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] GetBackBuffer2(%d) -> 0x%08X data 0x%08X\n",
+                g_shadow_swaps, (int32_t)HLE_ARG(0), g_eax,
+                g_eax ? HLE_MEM32(g_eax + 4) : 0);
 #endif
 }
 
@@ -2507,6 +2632,9 @@ HLE_EXPORT(D3DDevice_CopyRects)
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_CopyRects);
 #ifdef _WIN32
+    if (g_shadow && src && dst && shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] CopyRects src 0x%08X data 0x%08X -> dst 0x%08X data 0x%08X\n",
+                g_shadow_swaps, src, HLE_MEM32(src + 4), dst, HLE_MEM32(dst + 4));
     if (g_shadow && src && dst) {
         static unsigned long from_screen, elsewhere;
         static int said_other;
