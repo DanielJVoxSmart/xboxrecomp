@@ -3733,15 +3733,25 @@ static void bridge_NtReadFile(void)
          * read, then sleeps until the routine fires, would wait forever if it
          * were told the read was still pending. XAPI's ReadFile passes no
          * routine, which is the path Burnout 2's stream reader uses. */
-        fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> %s\n",
-                STACK_ARG(1), STACK_ARG(2),
-                STACK_ARG(2) ? "completed now" : "pending");
+        if (!STACK_ARG(2) && !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
+            g_eax = 0x00000103u;           /* STATUS_PENDING */
+
+        /* The status actually returned, not a guess from the APC argument.
+         *
+         * This line said "pending" whenever there was no APC, whatever the
+         * call returned, so RECOMP_FILE_SYNC -- whose entire job is to stop
+         * returning STATUS_PENDING -- made no visible difference and looked
+         * like it had no effect. TimeSplitters: Future Perfect terminates its
+         * loader thread with exit status 0x103, which is STATUS_PENDING, so
+         * whether this call is the source of that is exactly the question
+         * the log has to be able to answer. */
+        fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> 0x%08X%s\n",
+                STACK_ARG(1), STACK_ARG(2), g_eax,
+                g_eax == 0x00000103u ? " STATUS_PENDING" : "");
         /* RECOMP_FILE_SYNC=1 reports the read finished, for a title whose
          * loader does not come back for the result. Burnout 2 needs the
          * opposite -- its stream reader only accepts a short count on the
          * pending path -- so this is a switch, not a change. */
-        if (!STACK_ARG(2) && !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
-            g_eax = 0x00000103u;           /* STATUS_PENDING */
     }
 }
 

@@ -2235,6 +2235,14 @@ static void surface_measure(uint32_t va, UINT *w, UINT *h, uint32_t *fmt)
     }
 }
 
+static int rt_parentless_is_backbuffer(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_RT_PARENTLESS_BACKBUFFER", 0);
+    return on;
+}
+
 static IDirect3DTexture8 *scratch_target(UINT w, UINT h)
 {
     int i;
@@ -2320,8 +2328,32 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             texture = hle_d3d8_render_texture(g_shadow, parent);   /* level 0 */
             target = (IDirect3DBaseTexture8 *)texture;
             kind = texture ? 1 : 2;
-        } else if (g_backbuffer_va ? rt == g_backbuffer_va
-                                   : (!parent && w == g_shadow_width && h == g_shadow_height)) {
+        } else if (g_backbuffer_va == rt ||
+                   (!parent && w == g_shadow_width && h == g_shadow_height
+                    && rt_parentless_is_backbuffer())) {
+            /* A parentless surface the size of the screen is a back buffer.
+             *
+             * This used to accept only the one VA CreateDevice named, once it
+             * had named one, and send every other parentless screen-sized
+             * surface to a scratch target whose contents are thrown away.
+             * A double-buffered title has two of them and alternates, so half
+             * its frames were being drawn into nothing: TimeSplitters: Future
+             * Perfect sets 13,767 render targets in two minutes and 6,883 of
+             * them -- almost exactly half -- went to scratch, its two
+             * surfaces sitting 0x18 apart at 0x003E5984 and 0x003E599C.
+             *
+             * Measured on Future Perfect: it takes scratch targets from
+             * 6,883 to 0 and the screen from black-with-a-loading-icon to
+             * pure white, because 0x003E599C is an offscreen surface the
+             * title clears, not a second back buffer. So this is OFF by
+             * default and kept only as a switch for the next title whose
+             * two screen-sized surfaces really are a swap pair.
+             *
+             * RECOMP_RT_PARENTLESS_BACKBUFFER=1 enables it. The
+             * scratch path exists because an offscreen pass that lands on the
+             * screen is worse than one that vanishes -- that is what kept
+             * Burnout 2 black -- so this is a switch until the library has
+             * been measured with it. */
             kind = 0;
         } else {
             kind = 2;
