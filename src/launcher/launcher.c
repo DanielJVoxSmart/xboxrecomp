@@ -80,6 +80,17 @@ static int        g_sel;
 
 #define BIND_ROWS_VISIBLE 5
 
+/* The input list starts with three rows that are not controls: which
+ * controller is being edited, what it reads from, and putting it back.
+ * They live in the list rather than off to one side so they are reached
+ * the same way as everything else -- one way to move, one way to
+ * change, and no second idea to learn. */
+#define BIND_HEAD_ROWS 3
+#define BIND_ROW_PORT   0
+#define BIND_ROW_DEVICE 1
+#define BIND_ROW_RESET  2
+#define BIND_TOTAL_ROWS (BIND_HEAD_ROWS + BIND_CONTROLS)
+
 static const char *frame_cap_label(int i)
 {
     switch (i) {
@@ -348,7 +359,7 @@ static void capture_tick(void)
         return;
 
     {
-        int k = g_bind_top + g_sel;
+        int k = g_bind_top + g_sel - BIND_HEAD_ROWS;
 
         if (k >= 0 && k < BIND_CONTROLS) {
             char *dst = (g_bind_col == 0) ? g_bind.port[g_bind_port].pad_src[k]
@@ -592,7 +603,7 @@ static void input_move(int dy)
     int k = g_bind_top + g_sel + dy;
 
     if (k < 0) k = 0;
-    if (k >= BIND_CONTROLS) k = BIND_CONTROLS - 1;
+    if (k >= BIND_TOTAL_ROWS) k = BIND_TOTAL_ROWS - 1;
     if (k < g_bind_top)
         g_bind_top = k;
     else if (k >= g_bind_top + BIND_ROWS_VISIBLE)
@@ -614,13 +625,56 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
         set_tab((Tab)((g_tab + tabdelta + TAB_COUNT) % TAB_COUNT));
 
     if (g_tab == TAB_INPUT) {
-        if (dy)
+        int k = g_bind_top + g_sel;
+
+        if (dy) {
             input_move(dy);
-        if (dx)
-            g_bind_col = g_bind_col ? 0 : 1;
-        if (accept) {
-            g_capturing = 1;
-            g_capture_armed = 0;        /* wait for the accept to be let go */
+            return;
+        }
+        if (k == BIND_ROW_PORT) {
+            if (dx) {
+                g_bind_port = (g_bind_port + dx + BIND_PORTS) % BIND_PORTS;
+                g_bind_col = 0;
+            }
+        } else if (k == BIND_ROW_DEVICE) {
+            if (dx) {
+                /* One list, in the order a person would try them:
+                 * the four pads, then the keyboard, then nothing. */
+                BindPort *bp = &g_bind.port[g_bind_port];
+                int cur = (bp->device == BIND_DEV_XINPUT) ? bp->pad
+                        : (bp->device == BIND_DEV_KEYBOARD) ? BIND_PORTS
+                        : BIND_PORTS + 1;
+
+                cur = (cur + dx + BIND_PORTS + 2) % (BIND_PORTS + 2);
+                if (cur < BIND_PORTS) {
+                    bp->device = BIND_DEV_XINPUT;
+                    bp->pad = cur;
+                } else if (cur == BIND_PORTS) {
+                    bp->device = BIND_DEV_KEYBOARD;
+                    bp->pad = -1;
+                } else {
+                    bp->device = BIND_DEV_NONE;
+                    bp->pad = -1;
+                }
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_RESET) {
+            if (accept) {
+                BindConfig d;
+
+                /* This controller only: a person resetting controller 2
+                 * has said nothing about the other three. */
+                bind_defaults(&d);
+                g_bind.port[g_bind_port] = d.port[g_bind_port];
+                g_bind_dirty = 1;
+            }
+        } else {
+            if (dx)
+                g_bind_col = g_bind_col ? 0 : 1;
+            if (accept) {
+                g_capturing = 1;
+                g_capture_armed = 0;    /* wait for the accept to be let go */
+            }
         }
         if (cancel)
             PostMessage(g_hwnd, WM_CLOSE, 0, 0);
@@ -692,35 +746,14 @@ static void draw(void)
             theme_text(r, g_video_rows[g_sel].help, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
     } else if (g_tab == TAB_INPUT) {
         BindPort *bp = &g_bind.port[g_bind_port];
-        ThemeRect hdr = row_rect(0);
         char line[160];
         int i;
 
-        /* Which controller, and what it is being read from. */
-        hdr.h = 34;
-        hdr.y -= 10;
-        snprintf(line, sizeof line, "Controller %d", g_bind_port + 1);
-        theme_text(hdr, line, 13, 700, THEME_TEXT, THEME_LEFT);
-        {
-            ThemeRect d = hdr;
-
-            d.x += 170; d.w -= 170;
-            if (bp->device == BIND_DEV_XINPUT)
-                snprintf(line, sizeof line, "Gamepad %d%s", bp->pad + 1,
-                         XInputGetState((DWORD)bp->pad, &(XINPUT_STATE){0}) ==
-                             ERROR_SUCCESS ? "  (connected)" : "  (not plugged in)");
-            else if (bp->device == BIND_DEV_KEYBOARD)
-                snprintf(line, sizeof line, "Keyboard");
-            else
-                snprintf(line, sizeof line, "Nothing");
-            theme_text(d, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
-        }
-
         /* Column headings, so the two sides are not a guess. */
         {
-            ThemeRect h2 = hdr;
+            ThemeRect h2 = row_rect(0);
 
-            h2.y += 26; h2.h = 20;
+            h2.y -= 24; h2.h = 20;
             h2.x += 300; h2.w = 200;
             theme_text(h2, "CONTROLLER", 10, 700,
                        g_bind_col == 0 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
@@ -733,34 +766,75 @@ static void draw(void)
             int k = g_bind_top + i;
             ThemeRect rr, lr, cv;
             double lit;
+            const char *label = NULL;
 
-            if (k >= BIND_CONTROLS)
+            if (k >= BIND_TOTAL_ROWS)
                 break;
             rr = row_rect(i);
-            rr.y += 34;
             rr.h = 46;
             lit = (i == g_sel) ? 1.0 : 0.0;
             theme_panel(rr, lit);
 
             lr = rr; lr.x += 22; lr.w = 270;
-            theme_text(lr, bind_control_labels[k], 12, 600,
-                       lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+            cv = rr; cv.x += 300; cv.w = 400;
 
-            cv = rr; cv.x += 300; cv.w = 200;
-            theme_text(cv,
-                       (g_capturing && lit > 0.5 && g_bind_col == 0)
-                           ? "press something..." : bind_source_label(bp->pad_src[k]),
-                       12, 400,
-                       (lit > 0.5 && g_bind_col == 0) ? THEME_GREEN : THEME_TEXT_DIM,
-                       THEME_LEFT);
+            if (k == BIND_ROW_PORT) {
+                snprintf(line, sizeof line, "Controller %d", g_bind_port + 1);
+                theme_text(lr, "Editing", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_DEVICE) {
+                if (bp->device == BIND_DEV_XINPUT) {
+                    XINPUT_STATE st;
 
-            cv.x += 210;
-            theme_text(cv,
-                       (g_capturing && lit > 0.5 && g_bind_col == 1)
-                           ? "press a key..." : bind_source_label(bp->key_src[k]),
-                       12, 400,
-                       (lit > 0.5 && g_bind_col == 1) ? THEME_GREEN : THEME_TEXT_DIM,
-                       THEME_LEFT);
+                    memset(&st, 0, sizeof st);
+                    snprintf(line, sizeof line, "Gamepad %d%s", bp->pad + 1,
+                             XInputGetState((DWORD)bp->pad, &st) == ERROR_SUCCESS
+                                 ? "  (connected)" : "  (not plugged in)");
+                } else if (bp->device == BIND_DEV_KEYBOARD) {
+                    snprintf(line, sizeof line, "Keyboard");
+                } else {
+                    snprintf(line, sizeof line, "Nothing");
+                }
+                theme_text(lr, "Read from", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_RESET) {
+                theme_text(lr, "Reset this controller", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, "Back to the defaults", 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else {
+                int c = k - BIND_HEAD_ROWS;
+
+                label = bind_control_labels[c];
+                theme_text(lr, label, 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+
+                cv.w = 200;
+                theme_text(cv,
+                           (g_capturing && lit > 0.5 && g_bind_col == 0)
+                               ? "press something..." : bind_source_label(bp->pad_src[c]),
+                           12, 400,
+                           (lit > 0.5 && g_bind_col == 0) ? THEME_GREEN : THEME_TEXT_DIM,
+                           THEME_LEFT);
+                cv.x += 210;
+                theme_text(cv,
+                           (g_capturing && lit > 0.5 && g_bind_col == 1)
+                               ? "press a key..." : bind_source_label(bp->key_src[c]),
+                           12, 400,
+                           (lit > 0.5 && g_bind_col == 1) ? THEME_GREEN : THEME_TEXT_DIM,
+                           THEME_LEFT);
+            }
+
+            if (lit > 0.5 && k <= BIND_ROW_DEVICE) {
+                ThemeRect ar = rr;
+
+                ar.x = rr.x + rr.w - 46; ar.w = 30;
+                theme_arrows(ar, 1, 1, lit);
+            }
         }
 
         /* Where we are in a list longer than the screen. */
@@ -769,20 +843,27 @@ static void draw(void)
 
             sb.x = g_cw - 48;
             sb.w = 4;
-            sb.h = (BIND_ROWS_VISIBLE * 62) * BIND_ROWS_VISIBLE / BIND_CONTROLS;
-            sb.y = row_rect(0).y + 34 +
+            sb.h = (BIND_ROWS_VISIBLE * 62) * BIND_ROWS_VISIBLE / BIND_TOTAL_ROWS;
+            sb.y = row_rect(0).y +
                    (BIND_ROWS_VISIBLE * 62 - sb.h) * g_bind_top /
-                   (BIND_CONTROLS - BIND_ROWS_VISIBLE);
+                   (BIND_TOTAL_ROWS - BIND_ROWS_VISIBLE);
             theme_panel(sb, 0.5);
         }
 
-        r.x = 62; r.y = row_rect(0).y + 34 + BIND_ROWS_VISIBLE * 62 + 2;
+        r.x = 62; r.y = row_rect(0).y + BIND_ROWS_VISIBLE * 62 + 2;
         r.w = g_cw - 124; r.h = 40;
-        theme_text_wrapped(r, g_capturing
-            ? "Press what you want this to be. Escape cancels."
-            : "Left and right choose the controller or the keyboard column. "
-              "A or Enter rebinds. Bindings are shared by every game.",
-            11, THEME_TEXT_DIM);
+        {
+            int k = g_bind_top + g_sel;
+
+            theme_text_wrapped(r,
+                g_capturing ? "Press what you want this to be. Escape cancels."
+                : k == BIND_ROW_PORT   ? "Which of the four controllers these bindings are for."
+                : k == BIND_ROW_DEVICE ? "What this controller reads: a gamepad, the keyboard, or nothing."
+                : k == BIND_ROW_RESET  ? "Put this controller back to the built-in mapping."
+                : "Left and right choose the controller or the keyboard column. "
+                  "A or Enter rebinds. Bindings are shared by every game.",
+                11, THEME_TEXT_DIM);
+        }
     } else {
         ThemeRect p = row_rect(0);
         char line[1024];
@@ -900,13 +981,22 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             for (j = 0; j < BIND_ROWS_VISIBLE; j++) {
                 ThemeRect rr = row_rect(j);
 
-                rr.y += 34; rr.h = 46;
+                rr.h = 46;
                 if (my >= rr.y && my < rr.y + rr.h && mx >= rr.x &&
-                    mx < rr.x + rr.w && g_bind_top + j < BIND_CONTROLS) {
+                    mx < rr.x + rr.w && g_bind_top + j < BIND_TOTAL_ROWS) {
+                    int k = g_bind_top + j;
+
                     g_sel = j;
-                    g_bind_col = (mx >= rr.x + 510) ? 1 : 0;
-                    g_capturing = 1;
-                    g_capture_armed = 0;
+                    if (k < BIND_HEAD_ROWS) {
+                        /* The head rows change on a click, right half
+                         * forward and left half back, as the arrows say. */
+                        nav(mx > rr.x + rr.w / 2 ? 1 : -1, 0,
+                            k == BIND_ROW_RESET, 0, 0);
+                    } else {
+                        g_bind_col = (mx >= rr.x + 510) ? 1 : 0;
+                        g_capturing = 1;
+                        g_capture_armed = 0;
+                    }
                 }
             }
             if (hit_play(mx, my))
